@@ -199,5 +199,4 @@ def inspect_scan_inputs(modpack_dir: Path) -> dict[str, object]:
 
 
 def is_jar_lang_en_us_entry(name: str) -> bool:
-    normalized = name.lower().replace("\\", "/")
-    return normalized.startswith("assets/") and normalized.endswith("/lang/en_us.json")
+    return classify_jar_entry(name) == "jar_lang"

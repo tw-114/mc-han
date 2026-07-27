@@ -5,6 +5,7 @@ import json
 import zipfile
 
 from mc_han.cli import build_parser, main
+from mc_han.extractors.jar import scan_jar
 from mc_han.scanner import build_scan_report, scan_modpack, write_extracted_csv
 
 
@@ -231,3 +232,24 @@ def test_cli_parser_accepts_gui_command():
     args = build_parser().parse_args(["gui"])
 
     assert args.command == "gui"
+
+
+def test_scan_jar_skips_unsafe_entries_and_keeps_normal_entries(tmp_path):
+    jar_path = tmp_path / "paths.jar"
+    with zipfile.ZipFile(jar_path, "w") as jar:
+        jar.writestr("assets/../../../escape/ae2guide/page.md", "Unsafe guide text.")
+        jar.writestr("assets/../../escape/lang/en_us.json", json.dumps({"message.bad": "Unsafe text."}))
+        jar.writestr(r"assets\demo\..\escape\guides\page.md", "Unsafe Windows path.")
+        jar.writestr("assets/demo/ae2guide/page.md", "Safe guide text.")
+        jar.writestr("assets/demo/lang/en_us.json", json.dumps({"message.safe": "Safe language text."}))
+
+    records = scan_jar(jar_path, container="mods/paths.jar")
+
+    assert {record.file_path for record in records} == {
+        "assets/demo/ae2guide/page.md",
+        "assets/demo/lang/en_us.json",
+    }
+    assert {record.original for record in records} == {
+        "Safe guide text.",
+        "Safe language text.",
+    }

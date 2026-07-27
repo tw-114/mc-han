@@ -11,6 +11,7 @@ from mc_han.extractors.patchouli import extract_patchouli_json
 from mc_han.models import ExtractedText
 from mc_han.utils.encoding import decode_text
 from mc_han.utils.paths import relative_posix
+from mc_han.utils.safe_paths import UnsafePathError, parse_untrusted_relative_path
 
 
 def scan_mod_jars(modpack_dir: Path, *, translate_names: bool = False) -> list[ExtractedText]:
@@ -53,10 +54,14 @@ def scan_jar(jar_path: Path, *, container: str, translate_names: bool = False) -
 
 
 def classify_jar_entry(name: str) -> str | None:
-    path = PurePosixPath(name)
+    try:
+        safe_name = parse_untrusted_relative_path(name, label="JAR entry")
+    except UnsafePathError:
+        return None
+    path = PurePosixPath(safe_name.as_posix())
     parts = path.parts
     lower_parts = tuple(part.lower() for part in parts)
-    lower_name = name.lower()
+    lower_name = path.as_posix().lower()
 
     if not lower_parts or lower_parts[0] != "assets":
         return None
