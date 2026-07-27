@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+from collections import Counter
 import csv
 import json
 import zipfile
 
+import mc_han.scanner as scanner_module
 from mc_han.cli import build_parser, main
+from mc_han.extractors.jar import JarScanResult, scan_jar, scan_mod_jars
 from mc_han.scanner import build_scan_report, scan_modpack, write_extracted_csv
+from mc_han.utils.safe_zip import (
+    ACTUAL_READ_LIMIT,
+    COMPRESSION_RATIO_LIMIT,
+    ENTRY_COUNT_LIMIT,
+    ENTRY_SIZE_LIMIT,
+    JAR_TOTAL_SIZE_LIMIT,
+    ZipDiagnostic,
+    SafeZipReader,
+    ZipSafetyLimits,
+)
 
 
 def create_sample_modpack(tmp_path):
@@ -231,3 +244,200 @@ def test_cli_parser_accepts_gui_command():
     args = build_parser().parse_args(["gui"])
 
     assert args.command == "gui"
+
+
+def test_scan_jar_skips_unsafe_entries_and_keeps_normal_entries(tmp_path):
+    jar_path = tmp_path / "paths.jar"
+    with zipfile.ZipFile(jar_path, "w") as jar:
+        jar.writestr("assets/../../../escape/ae2guide/page.md", "Unsafe guide text.")
+        jar.writestr("assets/../../escape/lang/en_us.json", json.dumps({"message.bad": "Unsafe text."}))
+        jar.writestr(r"assets\demo\..\escape\guides\page.md", "Unsafe Windows path.")
+        jar.writestr("assets/demo/ae2guide/page.md", "Safe guide text.")
+        jar.writestr("assets/demo/lang/en_us.json", json.dumps({"message.safe": "Safe language text."}))
+
+    records = scan_jar(jar_path, container="mods/paths.jar")
+
+    assert {record.file_path for record in records} == {
+        "assets/demo/ae2guide/page.md",
+        "assets/demo/lang/en_us.json",
+    }
+    assert {record.original for record in records} == {
+        "Safe guide text.",
+        "Safe language text.",
+    }
+
+
+def test_scan_jar_skips_oversized_entry_and_keeps_safe_prior_result(tmp_path):
+    jar_path = tmp_path / "limits.jar"
+    with zipfile.ZipFile(jar_path, "w", compression=zipfile.ZIP_DEFLATED) as jar:
+        jar.writestr("assets/demo/ae2guide/a-safe.md", "Safe guide text.")
+        jar.writestr("assets/demo/ae2guide/z-large.md", "x" * 200)
+    diagnostics = []
+    limits = ZipSafetyLimits(
+        max_entries=20,
+        max_entry_uncompressed=100,
+        max_candidate_uncompressed_total=500,
+        max_actual_read_total=500,
+        max_compression_ratio=500.0,
+        chunk_size=16,
+    )
+
+    records = scan_jar(
+        jar_path,
+        container="mods/limits.jar",
+        limits=limits,
+        diagnostics=diagnostics,
+    )
+
+    assert [record.original for record in records] == ["Safe guide text."]
+    assert all(record.file_path != "assets/demo/ae2guide/z-large.md" for record in records)
+    assert [item.code for _container, item in diagnostics] == [ENTRY_SIZE_LIMIT]
+
+
+def test_jar_total_stop_preserves_safe_records_and_next_jar_is_scanned(tmp_path):
+    modpack = tmp_path / "pack"
+    mods_dir = modpack / "mods"
+    mods_dir.mkdir(parents=True)
+    with zipfile.ZipFile(mods_dir / "a-limited.jar", "w") as jar:
+        jar.writestr("assets/demo/ae2guide/a-safe.md", "Safe first.")
+        jar.writestr("assets/demo/ae2guide/b-limit.md", "Second entry is too much.")
+        jar.writestr("assets/demo/ae2guide/c-unread.md", "Must not be opened.")
+    with zipfile.ZipFile(mods_dir / "z-normal.jar", "w") as jar:
+        jar.writestr("assets/demo/ae2guide/page.md", "Later JAR remains safe.")
+    limits = ZipSafetyLimits(
+        max_entries=20,
+        max_entry_uncompressed=100,
+        max_candidate_uncompressed_total=30,
+        max_actual_read_total=200,
+        max_compression_ratio=200.0,
+        chunk_size=8,
+    )
+
+    records = scan_mod_jars(modpack, limits=limits)
+
+    assert {record.original for record in records} == {
+        "Safe first.",
+        "Later JAR remains safe.",
+    }
+
+
+def test_scan_jar_records_bad_zip_without_crashing(tmp_path):
+    jar_path = tmp_path / "broken.jar"
+    jar_path.write_bytes(b"not a zip archive")
+    diagnostics = []
+
+    records = scan_jar(
+        jar_path,
+        container="mods/broken.jar",
+        diagnostics=diagnostics,
+    )
+
+    assert records == []
+    assert diagnostics[0][1].code == "bad_zip"
+
+
+def test_scan_report_summarizes_zip_limits_with_relative_paths(tmp_path, monkeypatch):
+    modpack = tmp_path / "pack"
+    mods_dir = modpack / "mods"
+    mods_dir.mkdir(parents=True)
+    names_and_diagnostics = {
+        "entry-count.jar": ZipDiagnostic(
+            ENTRY_COUNT_LIMIT,
+            None,
+            "too many entries",
+            stops_jar=True,
+        ),
+        "entry-size.jar": ZipDiagnostic(
+            ENTRY_SIZE_LIMIT,
+            "assets/demo/ae2guide/large.md",
+            "entry too large",
+        ),
+        "total-size.jar": ZipDiagnostic(
+            JAR_TOTAL_SIZE_LIMIT,
+            "assets/demo/guides/page.md",
+            "candidate total too large",
+            stops_jar=True,
+        ),
+        "ratio.jar": ZipDiagnostic(
+            COMPRESSION_RATIO_LIMIT,
+            "assets/demo/lang/en_us.json",
+            "compression ratio too high",
+        ),
+        "actual-read.jar": ZipDiagnostic(
+            ACTUAL_READ_LIMIT,
+            "assets/demo/ae2guide/page.md",
+            "actual read too large",
+        ),
+    }
+    for jar_name in names_and_diagnostics:
+        (mods_dir / jar_name).write_bytes(b"placeholder")
+
+    def fake_inspection(
+        jar_path,
+        *,
+        container,
+        translate_names=False,
+        limits,
+        read_contents=True,
+    ):
+        return JarScanResult(
+            records=[],
+            supported_entries=Counter(),
+            diagnostics=[names_and_diagnostics[jar_path.name]],
+        )
+
+    monkeypatch.setattr(scanner_module, "inspect_and_scan_jar", fake_inspection)
+
+    report = build_scan_report(
+        modpack_dir=modpack,
+        records=[],
+        output_csv=modpack / "extracted_texts.csv",
+    )
+
+    assert "jars_stopped_by_entry_count_limit: 1" in report
+    assert "entries_rejected_by_size_limit: 1" in report
+    assert "jars_stopped_by_candidate_total_limit: 1" in report
+    assert "entries_rejected_by_compression_ratio: 1" in report
+    assert "entries_rejected_by_actual_read_limit: 1" in report
+    assert "[entry_size_limit] mods/entry-size.jar :: assets/demo/ae2guide/large.md" in report
+    assert str(tmp_path) not in report
+
+
+def test_scan_and_report_reuse_same_jar_read_and_diagnostics(tmp_path, monkeypatch):
+    modpack = tmp_path / "pack"
+    mods_dir = modpack / "mods"
+    mods_dir.mkdir(parents=True)
+    with zipfile.ZipFile(mods_dir / "limits.jar", "w") as jar:
+        jar.writestr("assets/demo/ae2guide/a-safe.md", "Safe guide text.")
+        jar.writestr("assets/demo/ae2guide/b-large.md", "x" * 200)
+    limits = ZipSafetyLimits(
+        max_entries=20,
+        max_entry_uncompressed=100,
+        max_candidate_uncompressed_total=500,
+        max_actual_read_total=500,
+        max_compression_ratio=500.0,
+        chunk_size=16,
+    )
+    original_read_entry = SafeZipReader.read_entry
+    read_calls = []
+
+    def count_reads(self, info):
+        read_calls.append(info.filename)
+        return original_read_entry(self, info)
+
+    monkeypatch.setattr(SafeZipReader, "read_entry", count_reads)
+
+    records = scan_modpack(modpack, zip_limits=limits)
+    reads_after_scan = list(read_calls)
+    report = build_scan_report(
+        modpack_dir=modpack,
+        records=records,
+        output_csv=modpack / "extracted_texts.csv",
+        zip_limits=limits,
+    )
+
+    assert len(records) == 1
+    assert reads_after_scan == ["assets/demo/ae2guide/a-safe.md"]
+    assert read_calls == reads_after_scan
+    assert "entries_rejected_by_size_limit: 1" in report
+    assert "[entry_size_limit] mods/limits.jar :: assets/demo/ae2guide/b-large.md" in report

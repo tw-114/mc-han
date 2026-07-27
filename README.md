@@ -52,6 +52,19 @@ python -m venv .venv
 python -m pip install -e .[dev]
 ```
 
+可选的 PySide6 新界面需要单独安装 Qt extra，不影响现有 CLI 和 Tkinter GUI：
+
+```powershell
+python -m pip install -e ".[qt]"
+mc-han-qt
+```
+
+开发时也可以运行：
+
+```powershell
+python -m mc_han.qt_app
+```
+
 也可以不安装包，直接用 `PYTHONPATH` 运行：
 
 ```powershell
@@ -124,6 +137,17 @@ GUI 生成的输出：
 多人服提示：服务端需要安装 server pack，每个玩家建议安装 client resourcepack。PCL2 开局域网或 FRP 穿透时，开服玩家也相当于服务器；Windows/PCL2 开服端建议添加 JVM 参数 `-Dfile.encoding=UTF-8`。
 
 以下 CLI 内容是备用入口，主要用于开发和排错。
+
+### 检测整合包
+
+在扫描或翻译前，可以先只读检测所选目录是否像 Minecraft 整合包，并查看版本、Loader、模组数量和可汉化内容：
+
+```powershell
+mc-han inspect "D:\Minecraft\MyModpack"
+mc-han inspect "D:\Minecraft\MyModpack" --json
+```
+
+检测只读取实例元数据和 JAR entry 名称，不会修改 `mods/*.jar`，也不会扫描或解压指南正文。
 
 ### 扫描
 
@@ -539,31 +563,39 @@ python -m pytest
 
 ## Windows Release 打包
 
-开发者在 Windows 上可以打包普通用户可直接运行的版本：
+### Windows 预览版
+
+`v0.7.0-alpha.1` 是新版 PySide6 界面的 Windows x64 预览版。下载 ZIP 后完整解压，
+再运行 `mc-han.exe`；不需要预先安装 Python。当前新界面只接入整合包选择和检测，
+正文扫描、AI 翻译、构建、安装与回滚尚未接入新界面。
+
+mc-han 不会修改 `mods/*.jar`。发布目录中的 `THIRD_PARTY_NOTICES.txt` 和
+`licenses` 目录列出了随程序分发的开源组件及许可证。源代码仓库：
+<https://github.com/tw-114/mc-han>
+
+开发者在 Windows 上使用隔离环境构建：
 
 ```powershell
-python -m pip install -e .[release]
-python tools\build_windows_release.py
+python -m venv .venv-release
+.\.venv-release\Scripts\python.exe -m pip install -e ".[qt,dev,release]"
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
 
 输出：
 
 ```text
-release\mc-han-0.6.1-windows\
-  mc-han-gui.exe
-  mc-han-cli.exe
+dist\mc-han\
+  mc-han.exe
   README.md
-  使用说明.txt
+  THIRD_PARTY_NOTICES.txt
+  licenses\
 
-release\mc-han-0.6.1-windows.zip
-release\mc-han-0.6.1-windows.zip.sha256.txt
+dist\mc-han-windows-x64-v0.7.0-alpha.1.zip
+dist\mc-han-windows-x64-v0.7.0-alpha.1.zip.sha256
 ```
 
-普通用户优先双击 `mc-han-gui.exe`。高级用户或排错时使用 `mc-han-cli.exe`。
+可用以下命令验证打包后的 Qt 界面：
 
-## 后续阶段
-
-后续会继续实现：
-
-- PySide6 多页面 GUI 重构
-- 更细的术语表和翻译审阅/局部重翻工作流
+```powershell
+dist\mc-han\mc-han.exe --smoke-test
+```

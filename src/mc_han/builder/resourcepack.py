@@ -8,13 +8,28 @@ from collections import defaultdict
 from pathlib import Path
 
 from mc_han.csv_store import read_extracted_csv
+from mc_han.extractors.jar import classify_jar_entry
 from mc_han.models import ExtractedText
 from mc_han.utils.encoding import decode_text
+from mc_han.utils.safe_paths import (
+    parse_untrusted_relative_path,
+    resolve_path_for_operation,
+)
+from mc_han.utils.safe_zip import (
+    BAD_ZIP,
+    DEFAULT_ZIP_LIMITS,
+    READ_ERROR,
+    SafeZipReader,
+    ZipSafetyError,
+    ZipSafetyLimits,
+)
 
 JAR_JSON_SOURCES = {"jar_patchouli", "jar_modonomicon"}
 JAR_MARKDOWN_SOURCES = {"jar_ae2guide", "jar_guides"}
 LANG_JSON_SOURCES = {"jar_lang", "kubejs_lang", "resourcepack_lang", "lang_name"}
 FTB_SOURCES = {"ftbquests_snbt", "ftbquests_lang"}
+JAR_CONTAINER_SOURCES = JAR_JSON_SOURCES | JAR_MARKDOWN_SOURCES | {"jar_lang"}
+MODPACK_CONTAINER_SOURCES = FTB_SOURCES | {"kubejs_lang", "resourcepack_lang", "lang_name"}
 
 
 def default_build_dir(modpack_dir: Path) -> Path:
@@ -107,6 +122,7 @@ def build_outputs(
     config_dir: Path | None = None,
     include_resourcepack: bool = True,
     include_config: bool = True,
+    zip_limits: ZipSafetyLimits = DEFAULT_ZIP_LIMITS,
 ) -> dict[str, int]:
     modpack_dir = Path(modpack_dir)
     output_dir = Path(output_dir)
@@ -115,93 +131,282 @@ def build_outputs(
     for row in rows:
         grouped[(row.source_type, row.container, row.file_path)].append(row)
 
+    pack_root = Path(resourcepack_dir) if resourcepack_dir else default_resourcepack_dir(output_dir)
+    config_root = Path(config_dir) if config_dir else output_dir
+    prevalidate_build_groups(
+        modpack_dir=modpack_dir,
+        pack_root=pack_root,
+        config_root=config_root,
+        grouped=grouped,
+        include_resourcepack=include_resourcepack,
+        include_config=include_config,
+    )
+
     stats = {
         "resource_files": 0,
         "config_files": 0,
         "translated_rows": len(rows),
         "name_rows": sum(1 for row in rows if row.source_type == "lang_name"),
     }
-    pack_root = Path(resourcepack_dir) if resourcepack_dir else default_resourcepack_dir(output_dir)
-    config_root = Path(config_dir) if config_dir else output_dir
     if include_resourcepack:
         write_pack_mcmeta(pack_root)
     lang_outputs: dict[Path, dict[str, str]] = defaultdict(dict)
 
     for (source_type, container, file_path), group in sorted(grouped.items()):
         if source_type in LANG_JSON_SOURCES and include_resourcepack:
-            output_path = pack_root / to_assets_resourcepack_path(file_path)
+            relative_output = to_assets_resourcepack_path(file_path)
             for row in group:
-                lang_outputs[output_path][row.key_path] = row.translation
+                lang_outputs[relative_output][row.key_path] = row.translation
         elif source_type in JAR_JSON_SOURCES and include_resourcepack:
-            text = read_container_file(modpack_dir, container, file_path)
+            text = read_container_file(
+                modpack_dir,
+                container,
+                file_path,
+                zip_limits=zip_limits,
+            )
             data = json.loads(text)
             for row in group:
                 set_json_path(data, row.key_path, row.translation)
-            output_path = pack_root / to_resourcepack_path(file_path)
-            write_text(output_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+            relative_output = to_resourcepack_path(file_path, source_type=source_type)
+            write_text_within_root(
+                pack_root,
+                relative_output.as_posix(),
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                label=f"resource-pack output for {file_path!r}",
+                allowed_top_levels={"assets"},
+            )
             stats["resource_files"] += 1
         elif source_type in JAR_MARKDOWN_SOURCES and include_resourcepack:
-            text = read_container_file(modpack_dir, container, file_path)
-            output_path = pack_root / to_resourcepack_path(file_path)
-            write_text(output_path, replace_exact_segments(text, group))
+            text = read_container_file(
+                modpack_dir,
+                container,
+                file_path,
+                zip_limits=zip_limits,
+            )
+            relative_output = to_resourcepack_path(file_path, source_type=source_type)
+            write_text_within_root(
+                pack_root,
+                relative_output.as_posix(),
+                replace_exact_segments(text, group),
+                label=f"resource-pack output for {file_path!r}",
+                allowed_top_levels={"assets"},
+            )
             stats["resource_files"] += 1
         elif source_type in FTB_SOURCES and include_config:
             text = read_container_file(modpack_dir, container, file_path)
-            output_path = config_root / to_config_overlay_path(file_path)
-            write_text(output_path, replace_exact_segments(text, group))
+            relative_output = to_config_overlay_path(file_path)
+            write_text_within_root(
+                config_root,
+                relative_output.as_posix(),
+                replace_exact_segments(text, group),
+                label=f"config output for {file_path!r}",
+                allowed_top_levels={"config"},
+            )
             stats["config_files"] += 1
 
-    for output_path, translations in sorted(lang_outputs.items(), key=lambda item: item[0].as_posix()):
-        write_text(output_path, json.dumps(dict(sorted(translations.items())), ensure_ascii=False, indent=2) + "\n")
+    for relative_output, translations in sorted(lang_outputs.items(), key=lambda item: item[0].as_posix()):
+        write_text_within_root(
+            pack_root,
+            relative_output.as_posix(),
+            json.dumps(dict(sorted(translations.items())), ensure_ascii=False, indent=2) + "\n",
+            label=f"resource-pack output {relative_output.as_posix()!r}",
+            allowed_top_levels={"assets"},
+        )
         stats["resource_files"] += 1
 
     write_build_report(output_dir, stats)
     return stats
 
 
-def read_container_file(modpack_dir: Path, container: str, file_path: str) -> str:
+def prevalidate_build_groups(
+    *,
+    modpack_dir: Path,
+    pack_root: Path,
+    config_root: Path,
+    grouped: dict[tuple[str, str, str], list[ExtractedText]],
+    include_resourcepack: bool,
+    include_config: bool,
+) -> None:
+    for source_type, container, file_path in sorted(grouped):
+        is_resource_group = source_type in LANG_JSON_SOURCES | JAR_JSON_SOURCES | JAR_MARKDOWN_SOURCES
+        is_config_group = source_type in FTB_SOURCES
+        if not ((include_resourcepack and is_resource_group) or (include_config and is_config_group)):
+            continue
+
+        validate_csv_container(modpack_dir, source_type=source_type, container=container)
+        if source_type in LANG_JSON_SOURCES:
+            if container == "modpack":
+                source_top_levels = (
+                    {"kubejs"}
+                    if source_type == "kubejs_lang"
+                    else {"resourcepacks"}
+                    if source_type == "resourcepack_lang"
+                    else {"kubejs", "resourcepacks"}
+                )
+                resolve_path_for_operation(
+                    modpack_dir,
+                    file_path,
+                    label="modpack language source path",
+                    allowed_top_levels=source_top_levels,
+                )
+            else:
+                parse_untrusted_relative_path(file_path, label="JAR entry")
+            relative_output = to_assets_resourcepack_path(file_path)
+            resolve_path_for_operation(
+                pack_root,
+                relative_output.as_posix(),
+                label=f"resource-pack output for {file_path!r}",
+                allowed_top_levels={"assets"},
+            )
+        elif source_type in JAR_JSON_SOURCES | JAR_MARKDOWN_SOURCES:
+            parse_untrusted_relative_path(file_path, label="JAR entry")
+            relative_output = to_resourcepack_path(file_path, source_type=source_type)
+            resolve_path_for_operation(
+                pack_root,
+                relative_output.as_posix(),
+                label=f"resource-pack output for {file_path!r}",
+                allowed_top_levels={"assets"},
+            )
+        elif source_type in FTB_SOURCES:
+            resolve_path_for_operation(
+                modpack_dir,
+                file_path,
+                label="modpack source path",
+                allowed_top_levels={"config"},
+            )
+            relative_output = to_config_overlay_path(file_path)
+            resolve_path_for_operation(
+                config_root,
+                relative_output.as_posix(),
+                label=f"config output for {file_path!r}",
+                allowed_top_levels={"config"},
+            )
+
+
+def validate_csv_container(modpack_dir: Path, *, source_type: str, container: str) -> None:
     if container == "modpack":
-        return decode_text((modpack_dir / file_path).read_bytes())
-    with zipfile.ZipFile(modpack_dir / container) as jar:
-        return decode_text(jar.read(file_path))
+        if source_type not in MODPACK_CONTAINER_SOURCES:
+            raise ValueError(f"{source_type} must use a JAR container under mods")
+        return
+    if source_type not in JAR_CONTAINER_SOURCES | {"lang_name"}:
+        raise ValueError(f"{source_type} must use the modpack container")
+    jar_path = resolve_path_for_operation(
+        modpack_dir,
+        container,
+        label="CSV JAR container",
+        allowed_top_levels={"mods"},
+    )
+    if jar_path.suffix.lower() != ".jar":
+        raise ValueError("CSV JAR container must be a .jar path under mods")
 
 
-def to_resourcepack_path(file_path: str) -> Path:
-    normalized = file_path.replace("\\", "/")
-    normalized = normalized.replace("/en_us/", "/zh_cn/")
-    return Path(*normalized.split("/"))
+def read_container_file(
+    modpack_dir: Path,
+    container: str,
+    file_path: str,
+    *,
+    zip_limits: ZipSafetyLimits = DEFAULT_ZIP_LIMITS,
+) -> str:
+    if container == "modpack":
+        source_path = resolve_path_for_operation(modpack_dir, file_path, label="modpack source path")
+        return decode_text(source_path.read_bytes())
+    jar_path = resolve_path_for_operation(
+        modpack_dir,
+        container,
+        label="JAR container path",
+        allowed_top_levels={"mods"},
+    )
+    jar_entry = parse_untrusted_relative_path(file_path, label="JAR entry")
+    entry_name = jar_entry.as_posix()
+    try:
+        with zipfile.ZipFile(jar_path) as jar:
+            reader: SafeZipReader[str] = SafeZipReader(jar, limits=zip_limits)
+            candidates = reader.prepare_candidates(classify_jar_entry)
+            if reader.stopped and reader.diagnostics:
+                diagnostic = reader.diagnostics[-1]
+                raise RuntimeError(
+                    f"JAR safety preflight stopped [{diagnostic.code}]: "
+                    f"{diagnostic.reason}"
+                )
+            selected = next((info for info, _source_type in candidates if info.filename == entry_name), None)
+            if selected is None:
+                matching_diagnostic = next(
+                    (item for item in reader.diagnostics if item.entry == entry_name),
+                    None,
+                )
+                if matching_diagnostic is not None:
+                    raise RuntimeError(
+                        f"Unsafe JAR entry refused [{matching_diagnostic.code}]: "
+                        f"{entry_name}: {matching_diagnostic.reason}"
+                    )
+                raise RuntimeError(f"Supported JAR entry not found: {entry_name}")
+            try:
+                return decode_text(reader.read_entry(selected))
+            except ZipSafetyError as error:
+                diagnostic = error.diagnostic
+                raise RuntimeError(
+                    f"Unsafe JAR entry refused [{diagnostic.code}]: "
+                    f"{entry_name}: {diagnostic.reason}"
+                ) from error
+    except (zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+        raise RuntimeError(f"Cannot read JAR [{BAD_ZIP}]: {container}") from error
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot read JAR [{READ_ERROR}]: {container}: {type(error).__name__}"
+        ) from error
+
+
+def to_resourcepack_path(file_path: str, *, source_type: str | None = None) -> Path:
+    source = parse_untrusted_relative_path(file_path, label="resource-pack source path")
+    parts = list(source.parts)
+    if source_type in JAR_JSON_SOURCES:
+        marker = "patchouli_books" if source_type == "jar_patchouli" else "modonomicon"
+        try:
+            marker_index = [part.lower() for part in parts].index(marker)
+        except ValueError:
+            marker_index = -1
+        for index in range(marker_index + 1, len(parts) - 1):
+            if marker_index >= 0 and parts[index].lower() == "en_us":
+                parts[index] = "zh_cn"
+    return Path(*parts)
 
 
 def to_assets_resourcepack_path(file_path: str) -> Path:
-    normalized = file_path.replace("\\", "/")
-    marker = "/assets/"
-    if normalized.startswith("assets/"):
-        assets_path = normalized
-    elif marker in normalized:
-        assets_path = normalized.split(marker, 1)[1]
-        assets_path = "assets/" + assets_path
-    else:
-        assets_path = normalized
-    assets_path = assets_path.replace("/lang/en_us.json", "/lang/zh_cn.json")
-    return Path(*assets_path.split("/"))
+    source = parse_untrusted_relative_path(file_path, label="language source path")
+    try:
+        assets_index = next(index for index, part in enumerate(source.parts) if part.lower() == "assets")
+    except StopIteration as error:
+        raise ValueError(f"Language source path does not contain an assets directory: {file_path!r}") from error
+    parts = ["assets", *source.parts[assets_index + 1 :]]
+    if len(parts) >= 3 and parts[-2].lower() == "lang" and parts[-1].lower() == "en_us.json":
+        parts[-1] = "zh_cn.json"
+    return Path(*parts)
 
 
 def to_config_overlay_path(file_path: str) -> Path:
-    normalized = file_path.replace("\\", "/")
-    normalized = normalized.replace("/lang/en_us.", "/lang/zh_cn.")
-    normalized = normalized.replace("/lang/en_us/", "/lang/zh_cn/")
-    return Path(*normalized.split("/"))
+    source = parse_untrusted_relative_path(file_path, label="config source path")
+    parts = list(source.parts)
+    for index, part in enumerate(parts):
+        if index > 0 and parts[index - 1] == "lang" and part == "en_us":
+            parts[index] = "zh_cn"
+        elif index > 0 and parts[index - 1] == "lang" and part.startswith("en_us."):
+            parts[index] = "zh_cn." + part[len("en_us.") :]
+    return Path(*parts)
 
 
 def write_pack_mcmeta(pack_root: Path) -> None:
-    pack_root.mkdir(parents=True, exist_ok=True)
     content = {
         "pack": {
             "pack_format": 15,
             "description": "mc-han generated Simplified Chinese localization pack",
         }
     }
-    write_text(pack_root / "pack.mcmeta", json.dumps(content, ensure_ascii=False, indent=2) + "\n")
+    write_text_within_root(
+        pack_root,
+        "pack.mcmeta",
+        json.dumps(content, ensure_ascii=False, indent=2) + "\n",
+        label="resource-pack metadata",
+    )
 
 
 def replace_exact_segments(content: str, rows: list[ExtractedText]) -> str:
@@ -241,6 +446,31 @@ def parse_key_path(key_path: str) -> list[str | int]:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8", newline="\n")
+
+
+def write_text_within_root(
+    root: Path,
+    relative_path: str,
+    content: str,
+    *,
+    label: str,
+    allowed_top_levels: set[str] | None = None,
+) -> Path:
+    target = resolve_path_for_operation(
+        root,
+        relative_path,
+        label=label,
+        allowed_top_levels=allowed_top_levels,
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target = resolve_path_for_operation(
+        root,
+        relative_path,
+        label=label,
+        allowed_top_levels=allowed_top_levels,
+    )
+    target.write_text(content, encoding="utf-8", newline="\n")
+    return target
 
 
 def write_build_report(output_dir: Path, stats: dict[str, int]) -> None:

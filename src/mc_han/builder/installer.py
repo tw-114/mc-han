@@ -7,6 +7,13 @@ from datetime import datetime
 from pathlib import Path
 
 from mc_han.quality.checks import check_output_dir
+from mc_han.utils.safe_paths import (
+    UnsafePathError,
+    path_identity_key,
+    resolve_path_for_operation,
+)
+
+ROLLBACK_TOP_LEVELS = {"resourcepacks", "config"}
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,13 @@ class RollbackResult:
     removed_files: int
     backup_dir: Path
     manifest_path: Path
+
+
+@dataclass(frozen=True)
+class RollbackPlanItem:
+    relative_target: str
+    had_backup: bool
+    backup_relative: str | None
 
 
 def plan_install_outputs(*, modpack_dir: Path, build_dir: Path) -> InstallPlan:
@@ -194,31 +208,56 @@ def install_outputs(*, modpack_dir: Path, build_dir: Path) -> InstallResult:
 
 def rollback_install(*, modpack_dir: Path, backup_dir: Path | None = None) -> RollbackResult:
     modpack_dir = Path(modpack_dir)
-    resolved_backup_dir = Path(backup_dir) if backup_dir else latest_backup_dir(modpack_dir)
-    manifest_path = resolved_backup_dir / "install_manifest.json"
+    resolved_backup_dir = (Path(backup_dir) if backup_dir else latest_backup_dir(modpack_dir)).resolve(strict=False)
+    try:
+        manifest_path = resolve_path_for_operation(
+            resolved_backup_dir,
+            "install_manifest.json",
+            label="install manifest path",
+        )
+        report_path = resolve_path_for_operation(
+            resolved_backup_dir,
+            "rollback_report.txt",
+            label="rollback report path",
+        )
+    except UnsafePathError as error:
+        raise RuntimeError(f"Unsafe rollback path: {error}") from error
     if not manifest_path.exists():
         raise RuntimeError(f"Install manifest not found: {manifest_path}")
+    manifest_path = resolve_path_for_operation(
+        resolved_backup_dir,
+        "install_manifest.json",
+        label="install manifest path",
+    )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rollback_plan = validate_rollback_manifest(
+        manifest,
+        modpack_dir=modpack_dir,
+        backup_dir=resolved_backup_dir,
+    )
     restored_files = 0
     removed_files = 0
 
-    for item in reversed(manifest.get("items", [])):
-        relative_target = item.get("relative_target", "")
-        if not isinstance(relative_target, str) or not relative_target:
-            continue
-        target = modpack_dir / Path(*relative_target.split("/"))
-        had_backup = bool(item.get("had_backup"))
-        if had_backup:
-            backup_source = resolved_backup_dir / Path(*relative_target.split("/"))
-            if backup_source.exists():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(backup_source, target)
-                restored_files += 1
-        elif target.exists():
-            target.unlink()
-            removed_files += 1
+    try:
+        for item in reversed(rollback_plan):
+            if item.had_backup:
+                if restore_rollback_target(
+                    modpack_dir=modpack_dir,
+                    backup_dir=resolved_backup_dir,
+                    item=item,
+                ):
+                    restored_files += 1
+            elif remove_rollback_target(modpack_dir=modpack_dir, item=item):
+                removed_files += 1
 
-    report_path = resolved_backup_dir / "rollback_report.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path = resolve_path_for_operation(
+            resolved_backup_dir,
+            "rollback_report.txt",
+            label="rollback report path",
+        )
+    except UnsafePathError as error:
+        raise RuntimeError(f"Unsafe rollback path changed before operation: {error}") from error
     report_path.write_text(
         "\n".join(
             [
@@ -237,6 +276,129 @@ def rollback_install(*, modpack_dir: Path, backup_dir: Path | None = None) -> Ro
         backup_dir=resolved_backup_dir,
         manifest_path=manifest_path,
     )
+
+
+def validate_rollback_manifest(
+    manifest: object,
+    *,
+    modpack_dir: Path,
+    backup_dir: Path,
+) -> list[RollbackPlanItem]:
+    if not isinstance(manifest, dict):
+        raise RuntimeError("Unsafe rollback manifest: root must be an object")
+    raw_items = manifest.get("items")
+    if not isinstance(raw_items, list):
+        raise RuntimeError("Unsafe rollback manifest: items must be a list")
+
+    plan: list[RollbackPlanItem] = []
+    target_keys: set[str] = set()
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, dict):
+            raise RuntimeError(f"Unsafe rollback manifest item {index}: item must be an object")
+        relative_target = raw_item.get("relative_target")
+        had_backup = raw_item.get("had_backup")
+        if not isinstance(had_backup, bool):
+            raise RuntimeError(f"Unsafe rollback manifest item {index}: had_backup must be a boolean")
+        try:
+            target = resolve_path_for_operation(
+                modpack_dir,
+                relative_target,
+                label=f"manifest item {index} relative_target",
+                allowed_top_levels=ROLLBACK_TOP_LEVELS,
+            )
+            target_key = path_identity_key(target)
+            if target_key in target_keys:
+                raise RuntimeError(f"Unsafe rollback manifest item {index}: duplicate target")
+            target_keys.add(target_key)
+            normalized_target = target.relative_to(Path(modpack_dir).resolve(strict=False)).as_posix()
+            backup_source: Path | None = None
+            normalized_backup: str | None = None
+            if had_backup:
+                raw_backup_relative = raw_item.get("backup_relative")
+                backup_relative = (
+                    relative_target if raw_backup_relative in (None, "") else raw_backup_relative
+                )
+                backup_source = resolve_path_for_operation(
+                    backup_dir,
+                    backup_relative,
+                    label=f"manifest item {index} backup_relative",
+                    allowed_top_levels=ROLLBACK_TOP_LEVELS,
+                )
+                normalized_backup = backup_source.relative_to(
+                    Path(backup_dir).resolve(strict=False)
+                ).as_posix()
+            else:
+                backup_relative = raw_item.get("backup_relative")
+                if backup_relative not in (None, ""):
+                    resolve_path_for_operation(
+                        backup_dir,
+                        backup_relative,
+                        label=f"manifest item {index} backup_relative",
+                        allowed_top_levels=ROLLBACK_TOP_LEVELS,
+                    )
+        except UnsafePathError as error:
+            raise RuntimeError(f"Unsafe rollback manifest item {index}: {error}") from error
+        plan.append(
+            RollbackPlanItem(
+                relative_target=normalized_target,
+                had_backup=had_backup,
+                backup_relative=normalized_backup,
+            )
+        )
+    return plan
+
+
+def restore_rollback_target(*, modpack_dir: Path, backup_dir: Path, item: RollbackPlanItem) -> bool:
+    if item.backup_relative is None:
+        return False
+    backup_source = resolve_path_for_operation(
+        backup_dir,
+        item.backup_relative,
+        label="rollback backup source",
+        allowed_top_levels=ROLLBACK_TOP_LEVELS,
+    )
+    if not backup_source.exists():
+        return False
+    target = resolve_path_for_operation(
+        modpack_dir,
+        item.relative_target,
+        label="rollback restore target",
+        allowed_top_levels=ROLLBACK_TOP_LEVELS,
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    backup_source = resolve_path_for_operation(
+        backup_dir,
+        item.backup_relative,
+        label="rollback backup source",
+        allowed_top_levels=ROLLBACK_TOP_LEVELS,
+    )
+    target = resolve_path_for_operation(
+        modpack_dir,
+        item.relative_target,
+        label="rollback restore target",
+        allowed_top_levels=ROLLBACK_TOP_LEVELS,
+    )
+    shutil.copy2(backup_source, target)
+    return True
+
+
+def remove_rollback_target(*, modpack_dir: Path, item: RollbackPlanItem) -> bool:
+    target = resolve_path_for_operation(
+        modpack_dir,
+        item.relative_target,
+        label="rollback removal target",
+        allowed_top_levels=ROLLBACK_TOP_LEVELS,
+    )
+    if not target.exists():
+        return False
+    target = resolve_path_for_operation(
+        modpack_dir,
+        item.relative_target,
+        label="rollback removal target",
+        allowed_top_levels=ROLLBACK_TOP_LEVELS,
+    )
+    target.unlink()
+    return True
 
 
 def backup_existing(path: Path, modpack_dir: Path, backup_dir: Path) -> int:
