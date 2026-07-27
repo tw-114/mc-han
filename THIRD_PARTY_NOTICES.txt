@@ -1,0 +1,46 @@
+mc-han Windows Preview - Third-Party Notices
+================================================
+
+Source repository: https://github.com/tw-114/mc-han
+
+The Windows distribution contains or bundles components from these projects:
+
+1. Python
+   Copyright (c) Python Software Foundation.
+   License: Python Software Foundation License Version 2.
+   License text: licenses/PYTHON-LICENSE.txt
+
+2. PySide6
+   Copyright (C) The Qt Company Ltd.
+   License: GNU Lesser General Public License v3, or a separately obtained
+   commercial Qt license. This distribution uses the LGPL option.
+   License text: licenses/LGPL-3.0.txt
+
+3. Qt
+   Copyright (C) The Qt Company Ltd. and other contributors.
+   The bundled Qt Core, GUI, Widgets, Network, OpenGL, and required Windows
+   platform/style components are distributed under the GNU Lesser General
+   Public License v3.
+   License text: licenses/LGPL-3.0.txt
+   Qt source offer and module licensing information:
+   https://www.qt.io/licensing/open-source-lgpl-obligations
+
+4. Shiboken6
+   Copyright (C) The Qt Company Ltd.
+   License: GNU Lesser General Public License v3.
+   License text: licenses/LGPL-3.0.txt
+
+5. PyInstaller
+   Copyright (c) PyInstaller Development Team.
+   License: GNU General Public License v2 or later, with the special exception
+   permitting distribution of bundled executables.
+   License and bootloader exception text:
+   licenses/PYINSTALLER-COPYING.txt
+
+Only Qt modules and plugins required by the Qt Widgets application are
+intentionally retained. The build does not use PySide6 --collect-all and does
+not add GPL-only Qt modules.
+
+The authoritative license files copied into this distribution should be
+consulted for complete terms. Component source code and license information
+are available from their upstream projects and the mc-han source repository.

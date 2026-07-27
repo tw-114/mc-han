@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mc-han"
-version = "0.6.1"
+version = "0.7.0a1"
 description = "Minecraft modpack localization assistant"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,7 +16,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 qt = ["PySide6>=6.8,<7"]
-release = ["pyinstaller>=6.21"]
+release = ["pyinstaller>=6.21,<7"]
 
 [project.scripts]
 mc-han = "mc_han.cli:main"

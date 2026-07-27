@@ -16,6 +16,7 @@ from .csv_store import read_extracted_csv
 from .preview import build_preview
 from .quality.checks import check_csv, check_output_dir, write_quality_report
 from .review import write_review_report
+from .version import get_version
 from .scanner import merge_existing_translations, scan_modpack, write_extracted_csv, write_scan_report
 from .services.modpack_inspector import inspect_modpack
 from .settings import UserSettings, clear_settings, config_path, load_settings, masked_api_key, merge_settings, save_settings
@@ -32,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mc-han",
         description="Minecraft modpack localization assistant.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {get_version()}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

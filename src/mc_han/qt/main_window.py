@@ -4,7 +4,7 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QThreadPool, Qt, Slot
+from PySide6.QtCore import QThreadPool, QTimer, Qt, Slot
 from PySide6.QtGui import QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -24,7 +25,9 @@ from mc_han.qt.pages.inspection_page import InspectionPage
 from mc_han.qt.task_runner import InspectionTask, TaskFailure
 from mc_han.qt.theme import application_stylesheet
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
+from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
+from mc_han.version import UNKNOWN_VERSION, get_version
 from mc_han.workflow.models import ModpackInspection
 
 
@@ -102,6 +105,10 @@ class MainWindow(QMainWindow):
         self.project_label = QLabel("未选择项目")
         self.project_label.setObjectName("MutedLabel")
         layout.addWidget(self.project_label)
+        about_button = QPushButton("关于")
+        about_button.setToolTip("查看版本和开源信息")
+        about_button.clicked.connect(self.show_about)
+        layout.addWidget(about_button)
         theme_button = QPushButton("主题")
         theme_button.setEnabled(False)
         theme_button.setToolTip("深色模式将在后续版本开放")
@@ -118,10 +125,17 @@ class MainWindow(QMainWindow):
         self.footer_status.setObjectName("MutedLabel")
         layout.addWidget(self.footer_status)
         layout.addStretch()
+        version_label = QLabel(f"v{get_version()}")
+        version_label.setObjectName("MutedLabel")
+        layout.addWidget(version_label)
         readonly = QLabel("JAR 只读")
         readonly.setProperty("tone", "success")
         layout.addWidget(readonly)
         return footer
+
+    @Slot()
+    def show_about(self) -> None:
+        QMessageBox.information(self, "关于 mc-han", about_text())
 
     def _build_scan_placeholder(self) -> QWidget:
         page = QWidget()
@@ -240,7 +254,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def run_qt_app(argv: Sequence[str] | None = None) -> int:
+def run_qt_app(
+    argv: Sequence[str] | None = None,
+    *,
+    smoke_test: bool = False,
+) -> int:
     application = QApplication.instance()
     owns_application = application is None
     if application is None:
@@ -254,4 +272,23 @@ def run_qt_app(argv: Sequence[str] | None = None) -> int:
     window.show()
     if not owns_application:
         return 0
-    return application.exec()
+
+    smoke_state = {"completed": not smoke_test, "valid": not smoke_test}
+    if smoke_test:
+        def complete_smoke_test() -> None:
+            smoke_state["completed"] = True
+            smoke_state["valid"] = (
+                window.isVisible()
+                and window.home_page.select_button.isEnabled()
+                and window.pages.currentWidget() is window.home_page
+                and get_version() != UNKNOWN_VERSION
+            )
+            window.close()
+            application.quit()
+
+        QTimer.singleShot(250, complete_smoke_test)
+
+    exit_code = application.exec()
+    if smoke_test and (not smoke_state["completed"] or not smoke_state["valid"]):
+        return 1
+    return exit_code

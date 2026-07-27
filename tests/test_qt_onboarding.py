@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QLabel
 from mc_han.qt.main_window import MainWindow
 from mc_han.qt.task_runner import InspectionTask
 from mc_han.qt.view_models import WorkflowStage
+from mc_han.version import get_version
 from mc_han.workflow.models import (
     CAPABILITY_ORDER,
     ChineseResourceStatus,
@@ -72,6 +73,7 @@ def test_window_smoke_and_home_content(application: QApplication):
     assert window.size().width() >= 920
     assert "让 Minecraft 整合包汉化变得简单" in labels
     assert "尚无最近项目" in labels
+    assert f"v{get_version()}" in labels
     assert window.home_page.select_button.text() == "选择整合包"
 
     window.close()

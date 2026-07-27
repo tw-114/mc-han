@@ -563,31 +563,39 @@ python -m pytest
 
 ## Windows Release 打包
 
-开发者在 Windows 上可以打包普通用户可直接运行的版本：
+### Windows 预览版
+
+`v0.7.0-alpha.1` 是新版 PySide6 界面的 Windows x64 预览版。下载 ZIP 后完整解压，
+再运行 `mc-han.exe`；不需要预先安装 Python。当前新界面只接入整合包选择和检测，
+正文扫描、AI 翻译、构建、安装与回滚尚未接入新界面。
+
+mc-han 不会修改 `mods/*.jar`。发布目录中的 `THIRD_PARTY_NOTICES.txt` 和
+`licenses` 目录列出了随程序分发的开源组件及许可证。源代码仓库：
+<https://github.com/tw-114/mc-han>
+
+开发者在 Windows 上使用隔离环境构建：
 
 ```powershell
-python -m pip install -e .[release]
-python tools\build_windows_release.py
+python -m venv .venv-release
+.\.venv-release\Scripts\python.exe -m pip install -e ".[qt,dev,release]"
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
 
 输出：
 
 ```text
-release\mc-han-0.6.1-windows\
-  mc-han-gui.exe
-  mc-han-cli.exe
+dist\mc-han\
+  mc-han.exe
   README.md
-  使用说明.txt
+  THIRD_PARTY_NOTICES.txt
+  licenses\
 
-release\mc-han-0.6.1-windows.zip
-release\mc-han-0.6.1-windows.zip.sha256.txt
+dist\mc-han-windows-x64-v0.7.0-alpha.1.zip
+dist\mc-han-windows-x64-v0.7.0-alpha.1.zip.sha256
 ```
 
-普通用户优先双击 `mc-han-gui.exe`。高级用户或排错时使用 `mc-han-cli.exe`。
+可用以下命令验证打包后的 Qt 界面：
 
-## 后续阶段
-
-后续会继续实现：
-
-- PySide6 多页面 GUI 重构
-- 更细的术语表和翻译审阅/局部重翻工作流
+```powershell
+dist\mc-han\mc-han.exe --smoke-test
+```
