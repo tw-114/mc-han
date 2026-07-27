@@ -18,7 +18,9 @@ class WorkflowStage(str, Enum):
     WELCOME = "welcome"
     INSPECTING = "inspecting"
     INSPECTION_RESULT = "inspection_result"
-    SCAN_PLACEHOLDER = "scan_placeholder"
+    SCANNING = "scanning"
+    SCAN_RESULT = "scan_result"
+    TRANSLATION_CONFIG_PLACEHOLDER = "translation_config_placeholder"
 
 
 class StatusTone(str, Enum):

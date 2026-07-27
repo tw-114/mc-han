@@ -154,6 +154,15 @@ def application_stylesheet() -> str:
         border-radius: 3px;
         background: #2F80ED;
     }
+    QCheckBox#CategoryCheckBox {
+        font-size: 16px;
+        font-weight: 700;
+        spacing: 10px;
+    }
+    QCheckBox#CategoryCheckBox::indicator {
+        width: 18px;
+        height: 18px;
+    }
     QScrollBar:vertical {
         width: 10px;
         background: transparent;
