@@ -52,6 +52,19 @@ python -m venv .venv
 python -m pip install -e .[dev]
 ```
 
+可选的 PySide6 新界面需要单独安装 Qt extra，不影响现有 CLI 和 Tkinter GUI：
+
+```powershell
+python -m pip install -e ".[qt]"
+mc-han-qt
+```
+
+开发时也可以运行：
+
+```powershell
+python -m mc_han.qt_app
+```
+
 也可以不安装包，直接用 `PYTHONPATH` 运行：
 
 ```powershell
