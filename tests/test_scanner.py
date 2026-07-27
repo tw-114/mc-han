@@ -207,6 +207,8 @@ def test_write_extracted_csv_has_required_fields(tmp_path):
         "original",
         "translation",
         "note",
+        "review_status",
+        "skip_status",
     }
     assert all(row["translation"] == "" for row in rows)
 

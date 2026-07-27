@@ -65,6 +65,16 @@ mc-han-qt
 python -m mc_han.qt_app
 ```
 
+新版界面当前开发流程：
+
+```text
+选择整合包 → 自动检测 → 扫描并按类别选择内容
+```
+
+扫描分类会生成 `.mc-han/extracted_texts.csv` 和扫描报告，但不会调用翻译 API，
+因此不会产生 API 费用。用户可以取消不需要翻译的类别，`mods/*.jar` 在整个过程
+中始终保持只读。
+
 也可以不安装包，直接用 `PYTHONPATH` 运行：
 
 ```powershell
@@ -566,8 +576,8 @@ python -m pytest
 ### Windows 预览版
 
 `v0.7.0-alpha.1` 是新版 PySide6 界面的 Windows x64 预览版。下载 ZIP 后完整解压，
-再运行 `mc-han.exe`；不需要预先安装 Python。当前新界面只接入整合包选择和检测，
-正文扫描、AI 翻译、构建、安装与回滚尚未接入新界面。
+再运行 `mc-han.exe`；不需要预先安装 Python。该预览版只接入整合包选择和检测，
+正文扫描、AI 翻译、构建、安装与回滚尚未接入该已发布版本。
 
 mc-han 不会修改 `mods/*.jar`。发布目录中的 `THIRD_PARTY_NOTICES.txt` 和
 `licenses` 目录列出了随程序分发的开源组件及许可证。源代码仓库：

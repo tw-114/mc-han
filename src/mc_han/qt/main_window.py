@@ -22,17 +22,27 @@ from PySide6.QtWidgets import (
 
 from mc_han.qt.pages.home_page import HomePage
 from mc_han.qt.pages.inspection_page import InspectionPage
-from mc_han.qt.task_runner import InspectionTask, TaskFailure
+from mc_han.qt.pages.scan_page import ScanPage
+from mc_han.qt.scan_view_models import ScanPageViewModel, ScanProgressViewModel
+from mc_han.qt.task_runner import InspectionTask, ScanTask, TaskFailure
 from mc_han.qt.theme import application_stylesheet
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
+from mc_han.services.scan_service import scan_and_classify
 from mc_han.version import UNKNOWN_VERSION, get_version
 from mc_han.workflow.models import ModpackInspection
+from mc_han.workflow.scan_models import (
+    ScanCategoryId,
+    ScanClassificationResult,
+    ScanProgressEvent,
+    ScanSelectionState,
+)
 
 
 DirectoryPicker = Callable[[], str | None]
 InspectionService = Callable[[Path], ModpackInspection]
+ScanService = Callable[..., ScanClassificationResult]
 
 
 class MainWindow(QMainWindow):
@@ -40,16 +50,23 @@ class MainWindow(QMainWindow):
         self,
         *,
         inspection_service: InspectionService = inspect_modpack,
+        scan_service: ScanService = scan_and_classify,
         directory_picker: DirectoryPicker | None = None,
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
+        self._scan_service = scan_service
         self._directory_picker = directory_picker or self._choose_directory
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
-        self._active_task: InspectionTask | None = None
+        self._active_task: InspectionTask | ScanTask | None = None
         self._inspection_running = False
+        self._scan_running = False
+        self._close_when_idle = False
+        self._close_scheduled = False
         self.current_inspection: ModpackInspection | None = None
+        self.current_scan_result: ScanClassificationResult | None = None
+        self.scan_selection: ScanSelectionState | None = None
         self.stage = WorkflowStage.WELCOME
 
         self.setWindowTitle("mc-han")
@@ -67,10 +84,12 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.home_page = HomePage()
         self.inspection_page = InspectionPage()
-        self.scan_placeholder_page = self._build_scan_placeholder()
+        self.scan_page = ScanPage()
+        self.translation_placeholder_page = self._build_translation_placeholder()
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
-        self.pages.addWidget(self.scan_placeholder_page)
+        self.pages.addWidget(self.scan_page)
+        self.pages.addWidget(self.translation_placeholder_page)
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
@@ -78,7 +97,20 @@ class MainWindow(QMainWindow):
         self.home_page.select_requested.connect(self.choose_and_inspect)
         self.inspection_page.reselect_requested.connect(self.choose_and_inspect)
         self.inspection_page.home_requested.connect(self.show_home)
-        self.inspection_page.scan_requested.connect(self.show_scan_placeholder)
+        self.inspection_page.scan_requested.connect(self.start_scan)
+        self.scan_page.back_requested.connect(self.show_inspection_result)
+        self.scan_page.rescan_requested.connect(self.start_scan)
+        self.scan_page.continue_requested.connect(
+            self.show_translation_config_placeholder
+        )
+        self.scan_page.select_all_requested.connect(self.select_all_scan_categories)
+        self.scan_page.clear_selection_requested.connect(
+            self.clear_scan_categories
+        )
+        self.scan_page.restore_defaults_requested.connect(
+            self.restore_scan_category_defaults
+        )
+        self.scan_page.category_toggled.connect(self.set_scan_category_selected)
         self.home_nav_button.clicked.connect(self.show_home)
         self.show_home()
 
@@ -137,20 +169,20 @@ class MainWindow(QMainWindow):
     def show_about(self) -> None:
         QMessageBox.information(self, "关于 mc-han", about_text())
 
-    def _build_scan_placeholder(self) -> QWidget:
+    def _build_translation_placeholder(self) -> QWidget:
         page = QWidget()
         page.setObjectName("AppRoot")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(32, 32, 32, 32)
         layout.addStretch()
-        title = QLabel("整合包检测已完成")
+        title = QLabel("扫描与分类已经完成")
         title.setObjectName("PageTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        detail = QLabel("扫描分类功能将在下一批接入。")
+        detail = QLabel("翻译服务配置将在下一批接入。")
         detail.setObjectName("MutedLabel")
         detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        back_button = QPushButton("返回检测结果")
-        back_button.clicked.connect(self.show_inspection_result)
+        back_button = QPushButton("返回扫描结果")
+        back_button.clicked.connect(self.show_scan_result)
         layout.addWidget(title)
         layout.addWidget(detail)
         layout.addWidget(back_button, alignment=Qt.AlignmentFlag.AlignCenter)
@@ -168,16 +200,18 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def choose_and_inspect(self) -> None:
-        if self._inspection_running:
+        if self._close_when_idle or self._inspection_running or self._scan_running:
             return
         selected = self._directory_picker()
         if selected:
             self.start_inspection(Path(selected))
 
     def start_inspection(self, path: Path) -> None:
-        if self._inspection_running:
+        if self._close_when_idle or self._inspection_running or self._scan_running:
             return
         self._inspection_running = True
+        self.current_scan_result = None
+        self.scan_selection = None
         self.stage = WorkflowStage.INSPECTING
         self.home_page.select_button.setEnabled(False)
         self.inspection_page.show_loading()
@@ -203,6 +237,7 @@ class MainWindow(QMainWindow):
         self.inspection_page.show_result(
             InspectionPageViewModel.from_inspection(inspection)
         )
+        self._close_if_pending()
 
     @Slot(object)
     def _inspection_failed(self, failure: TaskFailure) -> None:
@@ -212,10 +247,108 @@ class MainWindow(QMainWindow):
         self.home_page.select_button.setEnabled(True)
         self.footer_status.setText("检测未完成")
         self.inspection_page.show_failure(failure)
+        self._close_if_pending()
+
+    @Slot()
+    def start_scan(self) -> None:
+        if self._close_when_idle or self._inspection_running or self._scan_running:
+            return
+        inspection = self.current_inspection
+        if inspection is None or not inspection.can_continue:
+            return
+        self._scan_running = True
+        self.current_scan_result = None
+        self.scan_selection = None
+        self.stage = WorkflowStage.SCANNING
+        self.scan_page.show_loading(inspection.display_name)
+        self.pages.setCurrentWidget(self.scan_page)
+        self.home_nav_button.setChecked(False)
+        self.footer_status.setText("正在扫描整合包")
+
+        task = ScanTask(
+            inspection.input_directory,
+            self._scan_service,
+            inspection.existing_chinese,
+        )
+        task.signals.progress.connect(self._scan_progress)
+        task.signals.completed.connect(self._scan_completed)
+        task.signals.failed.connect(self._scan_failed)
+        self._active_task = task
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _scan_progress(self, event: ScanProgressEvent) -> None:
+        if not self._scan_running:
+            return
+        self.scan_page.update_progress(ScanProgressViewModel.from_event(event))
+
+    @Slot(object)
+    def _scan_completed(self, result: ScanClassificationResult) -> None:
+        self._scan_running = False
+        self._active_task = None
+        self.current_scan_result = result
+        self.scan_selection = ScanSelectionState.from_result(result)
+        self.stage = WorkflowStage.SCAN_RESULT
+        self.footer_status.setText("扫描与分类完成")
+        self._render_scan_result()
+        self._close_if_pending()
+
+    @Slot(object)
+    def _scan_failed(self, failure: TaskFailure) -> None:
+        self._scan_running = False
+        self._active_task = None
+        self.stage = WorkflowStage.SCAN_RESULT
+        self.footer_status.setText("扫描未完成")
+        self.scan_page.show_failure(failure)
+        self._close_if_pending()
+
+    @Slot(object, bool)
+    def set_scan_category_selected(
+        self,
+        category_id: ScanCategoryId,
+        selected: bool,
+    ) -> None:
+        if self.scan_selection is None:
+            return
+        self.scan_selection = self.scan_selection.set_selected(
+            category_id,
+            selected,
+        )
+        self._render_scan_result()
+
+    @Slot()
+    def select_all_scan_categories(self) -> None:
+        if self.scan_selection is not None:
+            self.scan_selection = self.scan_selection.select_all()
+            self._render_scan_result()
+
+    @Slot()
+    def clear_scan_categories(self) -> None:
+        if self.scan_selection is not None:
+            self.scan_selection = self.scan_selection.clear()
+            self._render_scan_result()
+
+    @Slot()
+    def restore_scan_category_defaults(self) -> None:
+        if self.scan_selection is not None:
+            self.scan_selection = self.scan_selection.restore_defaults()
+            self._render_scan_result()
+
+    def _render_scan_result(self) -> None:
+        if self.scan_selection is None or self.current_inspection is None:
+            return
+        self.scan_page.show_result(
+            ScanPageViewModel.from_selection(
+                self.current_inspection.display_name,
+                self.scan_selection,
+            )
+        )
+        self.pages.setCurrentWidget(self.scan_page)
+        self.home_nav_button.setChecked(False)
 
     @Slot()
     def show_home(self) -> None:
-        if self._inspection_running:
+        if self._inspection_running or self._scan_running:
             return
         self.stage = WorkflowStage.WELCOME
         self.pages.setCurrentWidget(self.home_page)
@@ -224,6 +357,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def show_inspection_result(self) -> None:
+        if self._scan_running:
+            return
         if self.current_inspection is None:
             self.show_home()
             return
@@ -232,13 +367,23 @@ class MainWindow(QMainWindow):
         self.home_nav_button.setChecked(False)
 
     @Slot()
-    def show_scan_placeholder(self) -> None:
-        if self.current_inspection is None or not self.current_inspection.can_continue:
+    def show_scan_result(self) -> None:
+        if self._scan_running:
             return
-        self.stage = WorkflowStage.SCAN_PLACEHOLDER
-        self.pages.setCurrentWidget(self.scan_placeholder_page)
+        if self.scan_selection is None:
+            self.show_inspection_result()
+            return
+        self.stage = WorkflowStage.SCAN_RESULT
+        self._render_scan_result()
+
+    @Slot()
+    def show_translation_config_placeholder(self) -> None:
+        if self.scan_selection is None or self.scan_selection.selected_record_count == 0:
+            return
+        self.stage = WorkflowStage.TRANSLATION_CONFIG_PLACEHOLDER
+        self.pages.setCurrentWidget(self.translation_placeholder_page)
         self.home_nav_button.setChecked(False)
-        self.footer_status.setText("等待扫描分类功能")
+        self.footer_status.setText("等待翻译服务配置")
 
     def _choose_directory(self) -> str | None:
         selected = QFileDialog.getExistingDirectory(
@@ -250,8 +395,38 @@ class MainWindow(QMainWindow):
         return selected or None
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._thread_pool.waitForDone(3000)
+        if self._inspection_running or self._scan_running:
+            event.ignore()
+            if not self._close_when_idle:
+                self._close_when_idle = True
+                self._disable_task_starters_for_pending_close()
+                self.footer_status.setText(
+                    "正在安全结束当前扫描，完成后将自动关闭"
+                )
+            # This keeps the event loop responsive until the read-only worker
+            # returns. A future batch can add cooperative cancellation checks;
+            # a thread blocked in operating-system I/O cannot be cancelled here.
+            return
+        self._close_when_idle = False
+        self._close_scheduled = False
         super().closeEvent(event)
+
+    def _disable_task_starters_for_pending_close(self) -> None:
+        self.home_page.select_button.setEnabled(False)
+        self.inspection_page.reselect_button.setEnabled(False)
+        self.inspection_page.start_scan_button.setEnabled(False)
+        self.scan_page.rescan_button.setEnabled(False)
+        self.scan_page.continue_button.setEnabled(False)
+
+    def _close_if_pending(self) -> None:
+        if not self._close_when_idle or self._close_scheduled:
+            return
+        self._close_scheduled = True
+        self._disable_task_starters_for_pending_close()
+        self.footer_status.setText(
+            "正在安全结束当前扫描，完成后将自动关闭"
+        )
+        QTimer.singleShot(0, self.close)
 
 
 def run_qt_app(
