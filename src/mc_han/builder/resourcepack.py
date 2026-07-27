@@ -8,11 +8,20 @@ from collections import defaultdict
 from pathlib import Path
 
 from mc_han.csv_store import read_extracted_csv
+from mc_han.extractors.jar import classify_jar_entry
 from mc_han.models import ExtractedText
 from mc_han.utils.encoding import decode_text
 from mc_han.utils.safe_paths import (
     parse_untrusted_relative_path,
     resolve_path_for_operation,
+)
+from mc_han.utils.safe_zip import (
+    BAD_ZIP,
+    DEFAULT_ZIP_LIMITS,
+    READ_ERROR,
+    SafeZipReader,
+    ZipSafetyError,
+    ZipSafetyLimits,
 )
 
 JAR_JSON_SOURCES = {"jar_patchouli", "jar_modonomicon"}
@@ -113,6 +122,7 @@ def build_outputs(
     config_dir: Path | None = None,
     include_resourcepack: bool = True,
     include_config: bool = True,
+    zip_limits: ZipSafetyLimits = DEFAULT_ZIP_LIMITS,
 ) -> dict[str, int]:
     modpack_dir = Path(modpack_dir)
     output_dir = Path(output_dir)
@@ -148,7 +158,12 @@ def build_outputs(
             for row in group:
                 lang_outputs[relative_output][row.key_path] = row.translation
         elif source_type in JAR_JSON_SOURCES and include_resourcepack:
-            text = read_container_file(modpack_dir, container, file_path)
+            text = read_container_file(
+                modpack_dir,
+                container,
+                file_path,
+                zip_limits=zip_limits,
+            )
             data = json.loads(text)
             for row in group:
                 set_json_path(data, row.key_path, row.translation)
@@ -162,7 +177,12 @@ def build_outputs(
             )
             stats["resource_files"] += 1
         elif source_type in JAR_MARKDOWN_SOURCES and include_resourcepack:
-            text = read_container_file(modpack_dir, container, file_path)
+            text = read_container_file(
+                modpack_dir,
+                container,
+                file_path,
+                zip_limits=zip_limits,
+            )
             relative_output = to_resourcepack_path(file_path, source_type=source_type)
             write_text_within_root(
                 pack_root,
@@ -280,7 +300,13 @@ def validate_csv_container(modpack_dir: Path, *, source_type: str, container: st
         raise ValueError("CSV JAR container must be a .jar path under mods")
 
 
-def read_container_file(modpack_dir: Path, container: str, file_path: str) -> str:
+def read_container_file(
+    modpack_dir: Path,
+    container: str,
+    file_path: str,
+    *,
+    zip_limits: ZipSafetyLimits = DEFAULT_ZIP_LIMITS,
+) -> str:
     if container == "modpack":
         source_path = resolve_path_for_operation(modpack_dir, file_path, label="modpack source path")
         return decode_text(source_path.read_bytes())
@@ -291,8 +317,43 @@ def read_container_file(modpack_dir: Path, container: str, file_path: str) -> st
         allowed_top_levels={"mods"},
     )
     jar_entry = parse_untrusted_relative_path(file_path, label="JAR entry")
-    with zipfile.ZipFile(jar_path) as jar:
-        return decode_text(jar.read(jar_entry.as_posix()))
+    entry_name = jar_entry.as_posix()
+    try:
+        with zipfile.ZipFile(jar_path) as jar:
+            reader: SafeZipReader[str] = SafeZipReader(jar, limits=zip_limits)
+            candidates = reader.prepare_candidates(classify_jar_entry)
+            if reader.stopped and reader.diagnostics:
+                diagnostic = reader.diagnostics[-1]
+                raise RuntimeError(
+                    f"JAR safety preflight stopped [{diagnostic.code}]: "
+                    f"{diagnostic.reason}"
+                )
+            selected = next((info for info, _source_type in candidates if info.filename == entry_name), None)
+            if selected is None:
+                matching_diagnostic = next(
+                    (item for item in reader.diagnostics if item.entry == entry_name),
+                    None,
+                )
+                if matching_diagnostic is not None:
+                    raise RuntimeError(
+                        f"Unsafe JAR entry refused [{matching_diagnostic.code}]: "
+                        f"{entry_name}: {matching_diagnostic.reason}"
+                    )
+                raise RuntimeError(f"Supported JAR entry not found: {entry_name}")
+            try:
+                return decode_text(reader.read_entry(selected))
+            except ZipSafetyError as error:
+                diagnostic = error.diagnostic
+                raise RuntimeError(
+                    f"Unsafe JAR entry refused [{diagnostic.code}]: "
+                    f"{entry_name}: {diagnostic.reason}"
+                ) from error
+    except (zipfile.BadZipFile, zipfile.LargeZipFile) as error:
+        raise RuntimeError(f"Cannot read JAR [{BAD_ZIP}]: {container}") from error
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot read JAR [{READ_ERROR}]: {container}: {type(error).__name__}"
+        ) from error
 
 
 def to_resourcepack_path(file_path: str, *, source_type: str | None = None) -> Path:
