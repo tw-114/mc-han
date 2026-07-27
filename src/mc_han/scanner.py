@@ -81,10 +81,20 @@ def merge_existing_translations(
     records: list[ExtractedText],
     existing_records: list[ExtractedText],
 ) -> list[ExtractedText]:
+    """Reuse user work only when source, context, and original text are unchanged.
+
+    Legacy review/skip markers stored in ``note`` remain supported alongside the
+    structured review_status and skip_status CSV columns.
+    """
     existing_by_key = {
         translation_reuse_key(record): record
         for record in existing_records
-        if record.translation.strip() or record.note.strip()
+        if (
+            record.translation.strip()
+            or record.note.strip()
+            or record.review_status.strip()
+            or record.skip_status.strip()
+        )
     }
     merged: list[ExtractedText] = []
     for record in records:
@@ -97,6 +107,8 @@ def merge_existing_translations(
                 record,
                 translation=existing.translation,
                 note=existing.note,
+                review_status=existing.review_status,
+                skip_status=existing.skip_status,
             )
         )
     if isinstance(records, ScanRecords):

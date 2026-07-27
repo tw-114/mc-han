@@ -14,6 +14,8 @@ class ExtractedText:
     original: str
     translation: str = ""
     note: str = ""
+    review_status: str = ""
+    skip_status: str = ""
 
     def to_csv_row(self) -> dict[str, str]:
         return {
@@ -25,6 +27,8 @@ class ExtractedText:
             "original": self.original,
             "translation": self.translation,
             "note": self.note,
+            "review_status": self.review_status,
+            "skip_status": self.skip_status,
         }
 
 
@@ -37,6 +41,8 @@ CSV_FIELDS = (
     "original",
     "translation",
     "note",
+    "review_status",
+    "skip_status",
 )
 
 
