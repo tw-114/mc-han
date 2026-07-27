@@ -125,6 +125,17 @@ GUI 生成的输出：
 
 以下 CLI 内容是备用入口，主要用于开发和排错。
 
+### 检测整合包
+
+在扫描或翻译前，可以先只读检测所选目录是否像 Minecraft 整合包，并查看版本、Loader、模组数量和可汉化内容：
+
+```powershell
+mc-han inspect "D:\Minecraft\MyModpack"
+mc-han inspect "D:\Minecraft\MyModpack" --json
+```
+
+检测只读取实例元数据和 JAR entry 名称，不会修改 `mods/*.jar`，也不会扫描或解压指南正文。
+
 ### 扫描
 
 ```powershell

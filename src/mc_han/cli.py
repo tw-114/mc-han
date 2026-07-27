@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -16,10 +17,12 @@ from .preview import build_preview
 from .quality.checks import check_csv, check_output_dir, write_quality_report
 from .review import write_review_report
 from .scanner import merge_existing_translations, scan_modpack, write_extracted_csv, write_scan_report
+from .services.modpack_inspector import inspect_modpack
 from .settings import UserSettings, clear_settings, config_path, load_settings, masked_api_key, merge_settings, save_settings
 from .translator.engine import TranslationProgress, translate_csv
 from .translator.mock_provider import MockTranslator
 from .translator.openai_provider import OpenAICompatibleTranslator, PROVIDER_PRESETS
+from .workflow.models import ChineseResourceStatus, InspectionValidity, ModpackInspection
 
 CUSTOM_PROVIDER = "custom"
 PROVIDER_CHOICES = ["mock", CUSTOM_PROVIDER, *sorted(PROVIDER_PRESETS)]
@@ -33,6 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("gui", help="Open the desktop GUI.")
+
+    inspect_parser = subparsers.add_parser(
+        "inspect",
+        help="Inspect a modpack directory without scanning text content.",
+    )
+    inspect_parser.add_argument("modpack_dir", type=Path, help="Minecraft modpack directory.")
+    inspect_parser.add_argument("--json", action="store_true", dest="json_output", help="Output machine-readable JSON.")
 
     config_parser = subparsers.add_parser("config", help="Show, save, or clear local provider settings.")
     config_subparsers = config_parser.add_subparsers(dest="config_command", required=True)
@@ -212,6 +222,51 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument("--no-checkpoint", action="store_true")
 
     return parser
+
+
+def run_inspect(modpack_dir: Path, *, json_output: bool = False) -> int:
+    inspection = inspect_modpack(modpack_dir)
+    if json_output:
+        print(json.dumps(inspection.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(format_inspection_summary(inspection))
+    return 2 if inspection.validity is InspectionValidity.INVALID else 0
+
+
+def format_inspection_summary(inspection: ModpackInspection) -> str:
+    validity_labels = {
+        InspectionValidity.VALID: "有效",
+        InspectionValidity.PROBABLE: "可能有效",
+        InspectionValidity.INVALID: "无效",
+    }
+    loader = inspection.loader_name
+    if inspection.loader_version != "unknown":
+        loader = f"{loader} {inspection.loader_version}"
+    available = [item.label for item in inspection.capabilities if item.detected]
+    chinese_labels = {
+        ChineseResourceStatus.NONE: "未发现",
+        ChineseResourceStatus.PARTIAL: "部分存在",
+        ChineseResourceStatus.UNKNOWN: "无法完整判断",
+    }
+    warning_count = sum(1 for item in inspection.messages if item.severity == "warning")
+    error_count = sum(1 for item in inspection.messages if item.severity == "error")
+    lines = [
+        f"整合包：{inspection.display_name}",
+        f"状态：{validity_labels[inspection.validity]}",
+        f"Minecraft：{inspection.minecraft_version}",
+        f"加载器：{loader}",
+        f"模组：{inspection.mod_count}",
+        f"可汉化内容：{'、'.join(available) if available else '未检测到'}",
+        f"已有中文：{chinese_labels[inspection.existing_chinese.status]}",
+        f"警告：{warning_count}",
+    ]
+    if error_count:
+        lines.append(f"错误：{error_count}")
+    for message in inspection.messages:
+        prefix = "错误" if message.severity == "error" else "警告" if message.severity == "warning" else "提示"
+        location = f" [{message.location}]" if message.location and message.location != "." else ""
+        lines.append(f"- {prefix}{location}：{message.message}")
+    return "\n".join(lines)
 
 
 def run_scan(modpack_dir: Path, output: Path | None = None, *, translate_names: bool = False) -> int:
@@ -636,6 +691,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .gui import run_gui
 
         return run_gui()
+    if args.command == "inspect":
+        return run_inspect(args.modpack_dir, json_output=args.json_output)
     if args.command == "config":
         return run_config(args)
     if args.command == "translate":
