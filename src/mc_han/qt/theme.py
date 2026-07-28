@@ -142,6 +142,21 @@ def application_stylesheet() -> str:
         color: #B5BBC5;
         background: transparent;
     }
+    QLineEdit, QComboBox, QSpinBox {
+        min-height: 36px;
+        padding: 0 10px;
+        background: #FFFFFF;
+        border: 1px solid #D8DDE6;
+        border-radius: 7px;
+        selection-background-color: #2F80ED;
+    }
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+        border-color: #2F80ED;
+    }
+    QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button {
+        border: 0;
+        width: 24px;
+    }
     QProgressBar {
         min-height: 7px;
         max-height: 7px;

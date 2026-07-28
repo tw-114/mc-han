@@ -204,7 +204,7 @@ def test_scan_starts_once_and_buttons_are_disabled_while_running(
     window.close()
 
 
-def test_category_selection_updates_total_and_placeholder(
+def test_category_selection_updates_total_and_opens_translation_config(
     application: QApplication,
     tmp_path: Path,
 ):
@@ -224,13 +224,14 @@ def test_category_selection_updates_total_and_placeholder(
     assert not window.scan_page.continue_button.isEnabled()
 
     window.restore_scan_category_defaults()
-    window.show_translation_config_placeholder()
-    assert window.stage is WorkflowStage.TRANSLATION_CONFIG_PLACEHOLDER
+    window.show_translation_config()
+    assert window.stage is WorkflowStage.TRANSLATION_CONFIG
     labels = {
         label.text()
-        for label in window.translation_placeholder_page.findChildren(QLabel)
+        for label in window.translation_config_page.findChildren(QLabel)
     }
-    assert "翻译服务配置将在下一批接入。" in labels
+    assert "翻译服务配置" in labels
+    assert "已选择 2 条内容，共 2 个分类" in labels
 
     window.close()
 
