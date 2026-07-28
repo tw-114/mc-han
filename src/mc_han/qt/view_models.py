@@ -26,6 +26,8 @@ class WorkflowStage(str, Enum):
     TRANSLATION_CHECK_PLACEHOLDER = "translation_check_placeholder"
     TRANSLATION_REVIEW = "translation_review"
     BUILD_PLACEHOLDER = "build_placeholder"
+    BUILD_INSTALL = "build_install"
+    COMPLETION = "completion"
 
 
 class StatusTone(str, Enum):

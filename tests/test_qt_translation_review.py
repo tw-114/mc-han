@@ -104,7 +104,7 @@ def _select(window: MainWindow, text_id: str) -> None:
     raise AssertionError(f"record not visible: {text_id}")
 
 
-def test_qt_review_edits_filters_statuses_and_opens_build_placeholder(
+def test_qt_review_edits_filters_statuses_and_opens_build_page(
     application: QApplication,
     tmp_path: Path,
 ):
@@ -182,9 +182,9 @@ def test_qt_review_edits_filters_statuses_and_opens_build_placeholder(
     page.retranslate_button.click()
     assert "没有调用 API" in page.feedback_label.text()
     page.continue_button.click()
-    assert window.stage is WorkflowStage.BUILD_PLACEHOLDER
-    assert window.pages.currentWidget() is window.build_placeholder_page
-    window.build_placeholder_page.back_button.click()
+    assert window.stage is WorkflowStage.BUILD_INSTALL
+    assert window.pages.currentWidget() is window.build_install_page
+    window.build_install_page.back_button.click()
     assert window.stage is WorkflowStage.TRANSLATION_REVIEW
     window.close()
     application.processEvents()

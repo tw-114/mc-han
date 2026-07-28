@@ -7,8 +7,8 @@ from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
-from PySide6.QtCore import QThreadPool, QTimer, Qt, Slot
-from PySide6.QtGui import QCloseEvent, QGuiApplication
+from PySide6.QtCore import QThreadPool, QTimer, Qt, QUrl, Slot
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -25,10 +25,16 @@ from PySide6.QtWidgets import (
 
 from mc_han.core.project import project_paths
 from mc_han.csv_store import read_extracted_csv
+from mc_han.builder.installer import InstallResult, RollbackResult
+from mc_han.qt.build_install_view_models import (
+    BuildInstallPageViewModel,
+    CompletionPageViewModel,
+)
 from mc_han.qt.full_translation_view_models import (
     FullTranslationPageViewModel,
 )
-from mc_han.qt.pages.build_placeholder_page import BuildPlaceholderPage
+from mc_han.qt.pages.build_install_page import BuildInstallPage
+from mc_han.qt.pages.completion_page import CompletionPage
 from mc_han.qt.pages.full_translation_page import FullTranslationPage
 from mc_han.qt.pages.home_page import HomePage
 from mc_han.qt.pages.inspection_page import InspectionPage
@@ -38,9 +44,13 @@ from mc_han.qt.pages.trial_translation_page import TrialTranslationPage
 from mc_han.qt.pages.translation_review_page import TranslationReviewPage
 from mc_han.qt.scan_view_models import ScanPageViewModel, ScanProgressViewModel
 from mc_han.qt.task_runner import (
+    BuildTask,
+    ExportTask,
     InspectionTask,
     FullTranslationTask,
     FullTranslationTaskResult,
+    InstallTask,
+    RollbackTask,
     ScanTask,
     TaskFailure,
     TrialTranslationTask,
@@ -62,6 +72,14 @@ from mc_han.qt.translation_review_view_models import (
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
+from mc_han.services.build_install import (
+    BuildWorkflowResult,
+    ExportWorkflowResult,
+    build_localization_package,
+    export_localization_zip,
+    install_localization_package,
+    rollback_localization_install,
+)
 from mc_han.services.scan_service import scan_and_classify
 from mc_han.services.trial_translation import (
     TrialTranslationError,
@@ -101,6 +119,11 @@ TrialPrepareService = Callable[
 ]
 TrialService = Callable[..., TrialTranslationResult]
 FullTranslatorFactory = Callable[[TranslationSessionConfig], object]
+BuildService = Callable[..., BuildWorkflowResult]
+ExportService = Callable[..., ExportWorkflowResult]
+InstallService = Callable[..., InstallResult]
+RollbackService = Callable[..., RollbackResult]
+DirectoryOpener = Callable[[Path], bool]
 
 
 class MainWindow(QMainWindow):
@@ -112,6 +135,11 @@ class MainWindow(QMainWindow):
         trial_prepare_service: TrialPrepareService = prepare_trial_samples,
         trial_service: TrialService = run_trial_translation,
         full_translator_factory: FullTranslatorFactory = create_translator,
+        build_service: BuildService = build_localization_package,
+        export_service: ExportService = export_localization_zip,
+        install_service: InstallService = install_localization_package,
+        rollback_service: RollbackService = rollback_localization_install,
+        directory_opener: DirectoryOpener | None = None,
         directory_picker: DirectoryPicker | None = None,
     ) -> None:
         super().__init__()
@@ -120,6 +148,11 @@ class MainWindow(QMainWindow):
         self._trial_prepare_service = trial_prepare_service
         self._trial_service = trial_service
         self._full_translator_factory = full_translator_factory
+        self._build_service = build_service
+        self._export_service = export_service
+        self._install_service = install_service
+        self._rollback_service = rollback_service
+        self._directory_opener = directory_opener or self._open_directory
         self._directory_picker = directory_picker or self._choose_directory
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
@@ -128,12 +161,17 @@ class MainWindow(QMainWindow):
             | ScanTask
             | TrialTranslationTask
             | FullTranslationTask
+            | BuildTask
+            | ExportTask
+            | InstallTask
+            | RollbackTask
             | None
         ) = None
         self._inspection_running = False
         self._scan_running = False
         self._trial_running = False
         self._full_running = False
+        self._build_running = False
         self._close_when_idle = False
         self._close_scheduled = False
         self.current_inspection: ModpackInspection | None = None
@@ -153,6 +191,9 @@ class MainWindow(QMainWindow):
         self._full_translated_before_run = 0
         self._full_elapsed_previous = 0.0
         self._full_started_at = 0.0
+        self._build_result: BuildWorkflowResult | None = None
+        self._install_result: InstallResult | None = None
+        self._export_result: ExportWorkflowResult | None = None
         self.stage = WorkflowStage.WELCOME
 
         self.setWindowTitle("mc-han")
@@ -175,7 +216,8 @@ class MainWindow(QMainWindow):
         self.trial_translation_page = TrialTranslationPage()
         self.full_translation_page = FullTranslationPage()
         self.translation_review_page = TranslationReviewPage()
-        self.build_placeholder_page = BuildPlaceholderPage()
+        self.build_install_page = BuildInstallPage()
+        self.completion_page = CompletionPage()
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
         self.pages.addWidget(self.scan_page)
@@ -183,7 +225,8 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.trial_translation_page)
         self.pages.addWidget(self.full_translation_page)
         self.pages.addWidget(self.translation_review_page)
-        self.pages.addWidget(self.build_placeholder_page)
+        self.pages.addWidget(self.build_install_page)
+        self.pages.addWidget(self.completion_page)
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
@@ -264,10 +307,27 @@ class MainWindow(QMainWindow):
             self.show_retranslate_placeholder
         )
         self.translation_review_page.continue_requested.connect(
-            self.show_build_placeholder
+            self.show_build_install
         )
-        self.build_placeholder_page.back_requested.connect(
+        self.build_install_page.back_requested.connect(
             self.show_translation_review
+        )
+        self.build_install_page.build_requested.connect(self.start_build)
+        self.build_install_page.export_requested.connect(self.start_export)
+        self.build_install_page.open_requested.connect(
+            self.open_output_directory
+        )
+        self.build_install_page.install_requested.connect(
+            self.start_install
+        )
+        self.completion_page.back_requested.connect(
+            self.show_build_install
+        )
+        self.completion_page.open_requested.connect(
+            self.open_output_directory
+        )
+        self.completion_page.rollback_requested.connect(
+            self.start_install_rollback
         )
         self.home_nav_button.clicked.connect(self.show_home)
         self.show_home()
@@ -356,6 +416,7 @@ class MainWindow(QMainWindow):
         self.trial_result = None
         self._trial_task_id = ""
         self._clear_full_translation_state()
+        self._clear_build_state()
         self.stage = WorkflowStage.INSPECTING
         self.home_page.select_button.setEnabled(False)
         self.inspection_page.show_loading()
@@ -1022,11 +1083,231 @@ class MainWindow(QMainWindow):
         )
 
     @Slot()
-    def show_build_placeholder(self) -> None:
-        self.stage = WorkflowStage.BUILD_PLACEHOLDER
-        self.pages.setCurrentWidget(self.build_placeholder_page)
+    def show_build_install(self) -> None:
+        if self._build_running:
+            return
+        self.stage = WorkflowStage.BUILD_INSTALL
+        self.pages.setCurrentWidget(self.build_install_page)
         self.home_nav_button.setChecked(False)
-        self.footer_status.setText("准备生成资源包")
+        self.footer_status.setText("生成与安装")
+        if self.current_inspection is None:
+            self.build_install_page.show_failure(
+                "无法确定当前整合包，请返回并重新选择项目。"
+            )
+            return
+        if self._build_result is None:
+            self.build_install_page.show_ready(
+                BuildInstallPageViewModel.ready(
+                    output_directory=str(
+                        project_paths(
+                            self.current_inspection.input_directory
+                        ).output_dir
+                    )
+                )
+            )
+        else:
+            self.build_install_page.show_result(
+                BuildInstallPageViewModel.from_result(
+                    self._build_result
+                )
+            )
+
+    @Slot()
+    def start_build(self) -> None:
+        if (
+            self._task_running()
+            or self._close_when_idle
+            or self.current_inspection is None
+        ):
+            return
+        paths = project_paths(self.current_inspection.input_directory)
+        self._build_running = True
+        self.build_install_page.show_running("正在生成资源包")
+        self.footer_status.setText("正在生成资源包")
+        task = BuildTask(
+            modpack_dir=self.current_inspection.input_directory,
+            csv_path=paths.extracted_csv,
+            output_dir=paths.output_dir,
+            minecraft_version=self.current_inspection.minecraft_version,
+            service=self._build_service,
+        )
+        task.signals.completed.connect(self._build_completed)
+        task.signals.failed.connect(self._build_operation_failed)
+        self._active_task = task
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _build_completed(self, result: BuildWorkflowResult) -> None:
+        self._finish_build_operation()
+        self._build_result = result
+        self.build_install_page.show_result(
+            BuildInstallPageViewModel.from_result(result)
+        )
+        self.footer_status.setText("资源包生成完成")
+        self._close_if_pending()
+
+    @Slot()
+    def start_export(self) -> None:
+        if not self._can_use_build_result():
+            return
+        self._build_running = True
+        self.build_install_page.show_running("正在导出 ZIP")
+        self.footer_status.setText("正在导出 ZIP")
+        task = ExportTask(
+            output_dir=self._build_result.output_dir,
+            service=self._export_service,
+        )
+        task.signals.completed.connect(self._export_completed)
+        task.signals.failed.connect(self._build_operation_failed)
+        self._active_task = task
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _export_completed(self, result: ExportWorkflowResult) -> None:
+        self._finish_build_operation()
+        self._export_result = result
+        self.completion_page.show_result(
+            CompletionPageViewModel.exported(result)
+        )
+        self._show_completion_page("ZIP 导出完成")
+        self._close_if_pending()
+
+    @Slot()
+    def start_install(self) -> None:
+        if (
+            not self._can_use_build_result()
+            or self.current_inspection is None
+        ):
+            return
+        self._build_running = True
+        self.build_install_page.show_running("正在安装汉化包")
+        self.footer_status.setText("正在安装汉化包")
+        task = InstallTask(
+            modpack_dir=self.current_inspection.input_directory,
+            output_dir=self._build_result.output_dir,
+            service=self._install_service,
+        )
+        task.signals.completed.connect(self._install_completed)
+        task.signals.failed.connect(self._build_operation_failed)
+        self._active_task = task
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _install_completed(self, result: InstallResult) -> None:
+        self._finish_build_operation()
+        self._install_result = result
+        self.completion_page.show_result(
+            CompletionPageViewModel.installed(result)
+        )
+        self._show_completion_page("汉化包安装完成")
+        self._close_if_pending()
+
+    @Slot()
+    def start_install_rollback(self) -> None:
+        if (
+            self._task_running()
+            or self._close_when_idle
+            or self.current_inspection is None
+            or self._install_result is None
+        ):
+            return
+        self._build_running = True
+        self.completion_page.show_running("正在撤销本次安装")
+        self.footer_status.setText("正在撤销本次安装")
+        task = RollbackTask(
+            modpack_dir=self.current_inspection.input_directory,
+            backup_dir=self._install_result.backup_dir,
+            service=self._rollback_service,
+        )
+        task.signals.completed.connect(self._rollback_completed)
+        task.signals.failed.connect(self._completion_operation_failed)
+        self._active_task = task
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _rollback_completed(self, result: RollbackResult) -> None:
+        self._finish_build_operation()
+        self._install_result = None
+        self.completion_page.show_result(
+            CompletionPageViewModel.rolled_back(result)
+        )
+        self.footer_status.setText("本次安装已撤销")
+        self._close_if_pending()
+
+    @Slot(object)
+    def _build_operation_failed(self, failure: TaskFailure) -> None:
+        self._finish_build_operation()
+        if self._build_result is None:
+            self.build_install_page.show_failure(failure.message)
+        else:
+            self.build_install_page.show_result(
+                BuildInstallPageViewModel.from_result(
+                    self._build_result
+                )
+            )
+            self.build_install_page.show_feedback(
+                failure.message,
+                error=True,
+            )
+        self.stage = WorkflowStage.BUILD_INSTALL
+        self.pages.setCurrentWidget(self.build_install_page)
+        self.footer_status.setText("生成或安装未完成")
+        self._close_if_pending()
+
+    @Slot(object)
+    def _completion_operation_failed(self, failure: TaskFailure) -> None:
+        self._finish_build_operation()
+        self.completion_page.show_failure(failure.message)
+        self.footer_status.setText("撤销安装未完成")
+        self._close_if_pending()
+
+    @Slot()
+    def open_output_directory(self) -> None:
+        if self.current_inspection is None:
+            return
+        output_dir = project_paths(
+            self.current_inspection.input_directory
+        ).output_dir
+        if not output_dir.is_dir():
+            self.build_install_page.show_feedback(
+                "输出目录尚不存在，请先生成资源包。",
+                error=True,
+            )
+            return
+        if not self._directory_opener(output_dir):
+            message = "无法打开输出目录，请在文件管理器中手动打开。"
+            if self.stage is WorkflowStage.COMPLETION:
+                self.completion_page.show_failure(message)
+            else:
+                self.build_install_page.show_feedback(
+                    message,
+                    error=True,
+                )
+
+    def _show_completion_page(self, status: str) -> None:
+        self.stage = WorkflowStage.COMPLETION
+        self.pages.setCurrentWidget(self.completion_page)
+        self.home_nav_button.setChecked(False)
+        self.footer_status.setText(status)
+
+    def _can_use_build_result(self) -> bool:
+        return (
+            not self._task_running()
+            and not self._close_when_idle
+            and self._build_result is not None
+            and not self._build_result.errors
+            and self._build_result.installable_files > 0
+        )
+
+    def _finish_build_operation(self) -> None:
+        self._build_running = False
+        self._active_task = None
+
+    @staticmethod
+    def _open_directory(path: Path) -> bool:
+        return QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(path))
+        )
 
     def _show_full_translation_page(self) -> None:
         self.stage = WorkflowStage.FULL_TRANSLATION
@@ -1080,6 +1361,14 @@ class MainWindow(QMainWindow):
         self.full_translation_page.pause_button.setEnabled(False)
         self.full_translation_page.resume_button.setEnabled(False)
         self.full_translation_page.retry_button.setEnabled(False)
+        self.build_install_page.back_button.setEnabled(False)
+        self.build_install_page.build_button.setEnabled(False)
+        self.build_install_page.open_button.setEnabled(False)
+        self.build_install_page.export_button.setEnabled(False)
+        self.build_install_page.install_button.setEnabled(False)
+        self.completion_page.back_button.setEnabled(False)
+        self.completion_page.open_button.setEnabled(False)
+        self.completion_page.rollback_button.setEnabled(False)
 
     def _close_if_pending(self) -> None:
         if not self._close_when_idle or self._close_scheduled:
@@ -1097,6 +1386,7 @@ class MainWindow(QMainWindow):
             or self._scan_running
             or self._trial_running
             or self._full_running
+            or self._build_running
         )
 
     def _pending_close_message(self) -> str:
@@ -1104,6 +1394,8 @@ class MainWindow(QMainWindow):
             return "正在安全结束当前试译，完成后将自动关闭"
         if self._full_running:
             return "正在保存当前翻译批次，完成后将自动关闭"
+        if self._build_running:
+            return "正在完成当前文件操作，完成后将自动关闭"
         return "正在安全结束当前扫描，完成后将自动关闭"
 
     def _clear_full_translation_state(self) -> None:
@@ -1116,6 +1408,12 @@ class MainWindow(QMainWindow):
         self._full_translated_before_run = 0
         self._full_elapsed_previous = 0.0
         self._full_started_at = 0.0
+
+    def _clear_build_state(self) -> None:
+        self._build_running = False
+        self._build_result = None
+        self._install_result = None
+        self._export_result = None
 
 
 def run_qt_app(

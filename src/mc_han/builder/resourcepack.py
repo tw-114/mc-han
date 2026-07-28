@@ -30,6 +30,49 @@ LANG_JSON_SOURCES = {"jar_lang", "kubejs_lang", "resourcepack_lang", "lang_name"
 FTB_SOURCES = {"ftbquests_snbt", "ftbquests_lang"}
 JAR_CONTAINER_SOURCES = JAR_JSON_SOURCES | JAR_MARKDOWN_SOURCES | {"jar_lang"}
 MODPACK_CONTAINER_SOURCES = FTB_SOURCES | {"kubejs_lang", "resourcepack_lang", "lang_name"}
+DEFAULT_RESOURCE_PACK_FORMAT = 15
+
+RESOURCE_PACK_FORMATS = {
+    (1, 6): 1,
+    (1, 7): 1,
+    (1, 8): 1,
+    (1, 9): 2,
+    (1, 10): 2,
+    (1, 11): 3,
+    (1, 12): 3,
+    (1, 13): 4,
+    (1, 14): 4,
+    (1, 15): 5,
+    (1, 16, 0): 5,
+    (1, 16, 1): 5,
+    (1, 16, 2): 6,
+    (1, 16, 3): 6,
+    (1, 16, 4): 6,
+    (1, 16, 5): 6,
+    (1, 17): 7,
+    (1, 18): 8,
+    (1, 19, 0): 9,
+    (1, 19, 1): 9,
+    (1, 19, 2): 9,
+    (1, 19, 3): 12,
+    (1, 19, 4): 13,
+    (1, 20, 0): 15,
+    (1, 20, 1): 15,
+    (1, 20, 2): 18,
+    (1, 20, 3): 22,
+    (1, 20, 4): 22,
+    (1, 20, 5): 32,
+    (1, 20, 6): 32,
+    (1, 21, 0): 34,
+    (1, 21, 1): 34,
+    (1, 21, 2): 42,
+    (1, 21, 3): 42,
+    (1, 21, 4): 46,
+    (1, 21, 5): 55,
+    (1, 21, 6): 63,
+    (1, 21, 7): 64,
+    (1, 21, 8): 64,
+}
 
 
 def default_build_dir(modpack_dir: Path) -> Path:
@@ -40,7 +83,13 @@ def default_resourcepack_dir(output_dir: Path) -> Path:
     return Path(output_dir) / "resourcepacks" / "mc-han-cn"
 
 
-def build_client_resourcepack(*, modpack_dir: Path, csv_path: Path, output_dir: Path) -> dict[str, int]:
+def build_client_resourcepack(
+    *,
+    modpack_dir: Path,
+    csv_path: Path,
+    output_dir: Path,
+    minecraft_version: str | None = None,
+) -> dict[str, int]:
     client_root = Path(output_dir) / "mc-han-client-resourcepack"
     stats = build_outputs(
         modpack_dir=modpack_dir,
@@ -48,6 +97,7 @@ def build_client_resourcepack(*, modpack_dir: Path, csv_path: Path, output_dir: 
         output_dir=output_dir,
         resourcepack_dir=client_root,
         include_config=False,
+        minecraft_version=minecraft_version,
     )
     write_text(
         client_root / "README_CLIENT.txt",
@@ -123,6 +173,7 @@ def build_outputs(
     include_resourcepack: bool = True,
     include_config: bool = True,
     zip_limits: ZipSafetyLimits = DEFAULT_ZIP_LIMITS,
+    minecraft_version: str | None = None,
 ) -> dict[str, int]:
     modpack_dir = Path(modpack_dir)
     output_dir = Path(output_dir)
@@ -149,7 +200,13 @@ def build_outputs(
         "name_rows": sum(1 for row in rows if row.source_type == "lang_name"),
     }
     if include_resourcepack:
-        write_pack_mcmeta(pack_root)
+        if minecraft_version is None:
+            write_pack_mcmeta(pack_root)
+        else:
+            write_pack_mcmeta(
+                pack_root,
+                minecraft_version=minecraft_version,
+            )
     lang_outputs: dict[Path, dict[str, str]] = defaultdict(dict)
 
     for (source_type, container, file_path), group in sorted(grouped.items()):
@@ -394,10 +451,42 @@ def to_config_overlay_path(file_path: str) -> Path:
     return Path(*parts)
 
 
-def write_pack_mcmeta(pack_root: Path) -> None:
+def resource_pack_format_for_version(
+    minecraft_version: str | None,
+) -> tuple[int, bool]:
+    if not minecraft_version:
+        return DEFAULT_RESOURCE_PACK_FORMAT, False
+    match = re.fullmatch(
+        r"\s*(\d+)\.(\d+)(?:\.(\d+))?\s*",
+        minecraft_version,
+    )
+    if match is None:
+        return DEFAULT_RESOURCE_PACK_FORMAT, False
+    major, minor, patch = (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3) or 0),
+    )
+    exact = RESOURCE_PACK_FORMATS.get((major, minor, patch))
+    if exact is not None:
+        return exact, True
+    family = RESOURCE_PACK_FORMATS.get((major, minor))
+    if family is not None:
+        return family, True
+    return DEFAULT_RESOURCE_PACK_FORMAT, False
+
+
+def write_pack_mcmeta(
+    pack_root: Path,
+    *,
+    minecraft_version: str | None = None,
+) -> None:
+    pack_format, _known = resource_pack_format_for_version(
+        minecraft_version
+    )
     content = {
         "pack": {
-            "pack_format": 15,
+            "pack_format": pack_format,
             "description": "mc-han generated Simplified Chinese localization pack",
         }
     }
