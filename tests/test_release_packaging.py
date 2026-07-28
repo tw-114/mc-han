@@ -29,13 +29,13 @@ def project_version() -> str:
 def test_package_runtime_and_release_names_use_one_version_source():
     expected = project_version()
 
-    assert expected == "0.7.0a1"
+    assert expected == "0.7.0a2"
     assert mc_han.__version__ == expected
     assert get_version() == expected
-    assert release_tag() == "v0.7.0-alpha.1"
-    assert windows_archive_name() == "mc-han-windows-x64-v0.7.0-alpha.1.zip"
+    assert release_tag() == "v0.7.0-alpha.2"
+    assert windows_archive_name() == "mc-han-windows-x64-v0.7.0-alpha.2.zip"
     assert windows_checksum_name() == (
-        "mc-han-windows-x64-v0.7.0-alpha.1.zip.sha256"
+        "mc-han-windows-x64-v0.7.0-alpha.2.sha256"
     )
     assert expected in about_text()
 
@@ -76,17 +76,18 @@ def test_windows_build_script_uses_derived_archive_name_and_audits_output():
     assert "THIRD_PARTY_NOTICES.txt" in script
     assert '"licenses"' in script
     assert "Get-FileHash" in script
+    assert "windows_checksum_name" in script
     assert re.search(r"translations\.sqlite", script)
 
 
 def test_release_notes_and_notices_describe_preview_boundary():
     notes = (
-        ROOT / "release-notes" / "v0.7.0-alpha.1.md"
+        ROOT / "release-notes" / "v0.7.0-alpha.2.md"
     ).read_text(encoding="utf-8")
     notices = (ROOT / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
 
     assert "预览版" in notes
-    assert "不是完整稳定版" in notes
+    assert "建议先备份整合包" in notes
     assert "不会修改 `mods/*.jar`" in notes
     assert "PySide6" in notices
     assert "Shiboken6" in notices

@@ -21,13 +21,13 @@ def windows_archive_name(version: str | None = None) -> str:
 
 
 def windows_checksum_name(version: str | None = None) -> str:
-    return f"{windows_archive_name(version)}.sha256"
+    return f"mc-han-windows-x64-{release_tag(version)}.sha256"
 
 
 def about_text(version: str | None = None) -> str:
     return (
         f"mc-han {version or get_version()}\n\n"
         "Minecraft 整合包自动汉化工具\n"
-        "当前 Windows 预览版仅接入整合包检测界面。\n\n"
+        "Windows MVP 预览版已接入检测、翻译、检查、构建与安装流程。\n\n"
         "源代码：https://github.com/tw-114/mc-han"
     )

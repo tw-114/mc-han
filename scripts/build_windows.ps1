@@ -195,7 +195,11 @@ try {
     Compress-Archive -LiteralPath $ReleaseDirectory -DestinationPath $ArchivePath -CompressionLevel Optimal
 
     $Digest = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-    $ChecksumPath = "$ArchivePath.sha256"
+    $ChecksumName = (& $PythonExe -c "from mc_han.release_info import windows_checksum_name; print(windows_checksum_name())").Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $ChecksumName) {
+        throw "Could not derive the release checksum name."
+    }
+    $ChecksumPath = Join-Path $RepoRoot "dist\$ChecksumName"
     [System.IO.File]::WriteAllText(
         $ChecksumPath,
         "$Digest  $ArchiveName`n",

@@ -1438,11 +1438,32 @@ def run_qt_app(
     smoke_state = {"completed": not smoke_test, "valid": not smoke_test}
     if smoke_test:
         def complete_smoke_test() -> None:
+            pages = (
+                window.home_page,
+                window.inspection_page,
+                window.scan_page,
+                window.translation_config_page,
+                window.trial_translation_page,
+                window.full_translation_page,
+                window.translation_review_page,
+                window.build_install_page,
+                window.completion_page,
+            )
+            pages_switchable = True
+            for page in pages:
+                window.pages.setCurrentWidget(page)
+                application.processEvents()
+                if window.pages.currentWidget() is not page:
+                    pages_switchable = False
+                    break
+            window.pages.setCurrentWidget(window.home_page)
+            application.processEvents()
             smoke_state["completed"] = True
             smoke_state["valid"] = (
                 window.isVisible()
                 and window.home_page.select_button.isEnabled()
                 and window.pages.currentWidget() is window.home_page
+                and pages_switchable
                 and get_version() != UNKNOWN_VERSION
             )
             window.close()

@@ -591,9 +591,10 @@ python -m pytest
 
 ### Windows 预览版
 
-`v0.7.0-alpha.1` 是新版 PySide6 界面的 Windows x64 预览版。下载 ZIP 后完整解压，
-再运行 `mc-han.exe`；不需要预先安装 Python。该预览版只接入整合包选择和检测，
-正文扫描、AI 翻译、构建、安装与回滚尚未接入该已发布版本。
+`v0.7.0-alpha.2` 是新版 PySide6 界面的 Windows x64 MVP 预览版。下载 ZIP 后完整解压，
+再运行 `mc-han.exe`；不需要预先安装 Python。该预览版已接入整合包检测与扫描分类、
+翻译服务配置、试译与完整翻译、用量统计、译文检查、构建、导出、安装和撤销安装。
+这是预览版本，处理重要整合包前建议先自行备份。
 
 mc-han 不会修改 `mods/*.jar`。发布目录中的 `THIRD_PARTY_NOTICES.txt` 和
 `licenses` 目录列出了随程序分发的开源组件及许可证。源代码仓库：
@@ -616,8 +617,8 @@ dist\mc-han\
   THIRD_PARTY_NOTICES.txt
   licenses\
 
-dist\mc-han-windows-x64-v0.7.0-alpha.1.zip
-dist\mc-han-windows-x64-v0.7.0-alpha.1.zip.sha256
+dist\mc-han-windows-x64-v0.7.0-alpha.2.zip
+dist\mc-han-windows-x64-v0.7.0-alpha.2.sha256
 ```
 
 可用以下命令验证打包后的 Qt 界面：
