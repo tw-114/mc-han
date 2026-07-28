@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QThread
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from mc_han.core.project import project_paths
 from mc_han.csv_store import read_extracted_csv, write_extracted_csv
@@ -387,4 +387,83 @@ def test_completed_trial_selection_skips_full_provider(
         window.stage
         is WorkflowStage.TRANSLATION_REVIEW
     )
+    _close_window(application, window)
+
+
+def test_settings_preserves_running_translation_page_and_single_task(
+    application: QApplication,
+    tmp_path: Path,
+):
+    started = threading.Event()
+    release = threading.Event()
+    provider = FakeFullProvider(started=started, release=release)
+    records = [
+        _record("trial", translation="试译结果"),
+        _record("pending"),
+    ]
+    window = _window(tmp_path, records, provider)
+    window.confirm_trial_translation()
+    window.start_full_translation()
+    _process_until(application, started.is_set)
+
+    window.settings_button.click()
+    application.processEvents()
+
+    assert window.pages.currentWidget() is window.settings_page
+    assert window.stage is WorkflowStage.FULL_TRANSLATION
+    assert window.session.active_task is not None
+    assert window.session.active_task.label == "完整翻译"
+    assert window.activity_label.text() == "活动任务：完整翻译"
+    assert all(
+        button.toolTip()
+        for button in window.findChildren(QPushButton)
+        if not button.isEnabled()
+    )
+
+    window.start_full_translation()
+    application.processEvents()
+    assert provider.calls == [("pending",)]
+    assert window._notice_boxes
+
+    window.settings_page.back_button.click()
+    application.processEvents()
+    assert window.pages.currentWidget() is window.full_translation_page
+    assert window.stage is WorkflowStage.FULL_TRANSLATION
+
+    release.set()
+    _process_until(
+        application,
+        lambda: window.stage is WorkflowStage.TRANSLATION_REVIEW,
+    )
+    assert window.session.active_task is None
+    _close_window(application, window)
+
+
+def test_full_translation_failure_releases_task_and_restores_start(
+    application: QApplication,
+    tmp_path: Path,
+):
+    provider = FakeFullProvider()
+    records = [
+        _record("trial", translation="试译结果"),
+        _record("pending"),
+    ]
+    window = _window(tmp_path, records, provider)
+
+    def fail_factory(_config):
+        raise RuntimeError("simulated translator creation failure")
+
+    window._full_translator_factory = fail_factory
+    window.confirm_trial_translation()
+    window.start_full_translation()
+    _process_until(
+        application,
+        lambda: not window._full_running,
+    )
+    application.processEvents()
+
+    assert provider.calls == []
+    assert window.session.active_task is None
+    assert window.full_translation_page.start_button.isEnabled()
+    assert window.activity_label.text() == "当前无活动任务"
     _close_window(application, window)
