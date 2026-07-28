@@ -23,9 +23,21 @@ from PySide6.QtWidgets import (
 from mc_han.qt.pages.home_page import HomePage
 from mc_han.qt.pages.inspection_page import InspectionPage
 from mc_han.qt.pages.scan_page import ScanPage
+from mc_han.qt.pages.translation_config_page import TranslationConfigPage
+from mc_han.qt.pages.trial_translation_placeholder_page import (
+    TrialTranslationPlaceholderPage,
+)
 from mc_han.qt.scan_view_models import ScanPageViewModel, ScanProgressViewModel
 from mc_han.qt.task_runner import InspectionTask, ScanTask, TaskFailure
 from mc_han.qt.theme import application_stylesheet
+from mc_han.qt.translation_config_view_models import (
+    TranslationConfigPageViewModel,
+    TranslationProvider,
+    TranslationSessionConfig,
+    recommended_translation_config,
+    validate_translation_config,
+    with_recommended_values,
+)
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
@@ -67,6 +79,8 @@ class MainWindow(QMainWindow):
         self.current_inspection: ModpackInspection | None = None
         self.current_scan_result: ScanClassificationResult | None = None
         self.scan_selection: ScanSelectionState | None = None
+        self.translation_config_draft: TranslationSessionConfig | None = None
+        self.translation_session_config: TranslationSessionConfig | None = None
         self.stage = WorkflowStage.WELCOME
 
         self.setWindowTitle("mc-han")
@@ -85,11 +99,13 @@ class MainWindow(QMainWindow):
         self.home_page = HomePage()
         self.inspection_page = InspectionPage()
         self.scan_page = ScanPage()
-        self.translation_placeholder_page = self._build_translation_placeholder()
+        self.translation_config_page = TranslationConfigPage()
+        self.trial_translation_page = TrialTranslationPlaceholderPage()
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
         self.pages.addWidget(self.scan_page)
-        self.pages.addWidget(self.translation_placeholder_page)
+        self.pages.addWidget(self.translation_config_page)
+        self.pages.addWidget(self.trial_translation_page)
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
@@ -100,9 +116,7 @@ class MainWindow(QMainWindow):
         self.inspection_page.scan_requested.connect(self.start_scan)
         self.scan_page.back_requested.connect(self.show_inspection_result)
         self.scan_page.rescan_requested.connect(self.start_scan)
-        self.scan_page.continue_requested.connect(
-            self.show_translation_config_placeholder
-        )
+        self.scan_page.continue_requested.connect(self.show_translation_config)
         self.scan_page.select_all_requested.connect(self.select_all_scan_categories)
         self.scan_page.clear_selection_requested.connect(
             self.clear_scan_categories
@@ -111,6 +125,24 @@ class MainWindow(QMainWindow):
             self.restore_scan_category_defaults
         )
         self.scan_page.category_toggled.connect(self.set_scan_category_selected)
+        self.translation_config_page.back_requested.connect(
+            self.return_to_scan_from_translation_config
+        )
+        self.translation_config_page.restore_requested.connect(
+            self.restore_recommended_translation_config
+        )
+        self.translation_config_page.validate_requested.connect(
+            self.validate_current_translation_config
+        )
+        self.translation_config_page.continue_requested.connect(
+            self.save_translation_config_and_continue
+        )
+        self.translation_config_page.provider_changed.connect(
+            self.change_translation_provider
+        )
+        self.trial_translation_page.back_requested.connect(
+            self.show_translation_config
+        )
         self.home_nav_button.clicked.connect(self.show_home)
         self.show_home()
 
@@ -169,26 +201,6 @@ class MainWindow(QMainWindow):
     def show_about(self) -> None:
         QMessageBox.information(self, "关于 mc-han", about_text())
 
-    def _build_translation_placeholder(self) -> QWidget:
-        page = QWidget()
-        page.setObjectName("AppRoot")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(32, 32, 32, 32)
-        layout.addStretch()
-        title = QLabel("扫描与分类已经完成")
-        title.setObjectName("PageTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        detail = QLabel("翻译服务配置将在下一批接入。")
-        detail.setObjectName("MutedLabel")
-        detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        back_button = QPushButton("返回扫描结果")
-        back_button.clicked.connect(self.show_scan_result)
-        layout.addWidget(title)
-        layout.addWidget(detail)
-        layout.addWidget(back_button, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addStretch()
-        return page
-
     @staticmethod
     def _nav_button(label: str, *, enabled: bool) -> QPushButton:
         button = QPushButton(label)
@@ -212,6 +224,8 @@ class MainWindow(QMainWindow):
         self._inspection_running = True
         self.current_scan_result = None
         self.scan_selection = None
+        self.translation_config_draft = None
+        self.translation_session_config = None
         self.stage = WorkflowStage.INSPECTING
         self.home_page.select_button.setEnabled(False)
         self.inspection_page.show_loading()
@@ -377,13 +391,75 @@ class MainWindow(QMainWindow):
         self._render_scan_result()
 
     @Slot()
-    def show_translation_config_placeholder(self) -> None:
+    def show_translation_config(self) -> None:
         if self.scan_selection is None or self.scan_selection.selected_record_count == 0:
             return
-        self.stage = WorkflowStage.TRANSLATION_CONFIG_PLACEHOLDER
-        self.pages.setCurrentWidget(self.translation_placeholder_page)
+        config = (
+            self.translation_config_draft
+            or self.translation_session_config
+            or recommended_translation_config()
+        )
+        self.translation_config_page.show_config(
+            TranslationConfigPageViewModel(
+                config=config,
+                selected_record_count=self.scan_selection.selected_record_count,
+                selected_category_count=len(
+                    self.scan_selection.selected_category_ids
+                ),
+            )
+        )
+        self.stage = WorkflowStage.TRANSLATION_CONFIG
+        self.pages.setCurrentWidget(self.translation_config_page)
         self.home_nav_button.setChecked(False)
-        self.footer_status.setText("等待翻译服务配置")
+        self.footer_status.setText("配置翻译服务")
+
+    @Slot()
+    def return_to_scan_from_translation_config(self) -> None:
+        self.translation_config_draft = (
+            self.translation_config_page.current_config()
+        )
+        self.show_scan_result()
+
+    @Slot(object)
+    def change_translation_provider(
+        self,
+        provider: TranslationProvider,
+    ) -> None:
+        current = self.translation_config_page.current_config()
+        updated = with_recommended_values(current, provider)
+        self.translation_config_draft = updated
+        self.translation_config_page.set_config(updated)
+        self.translation_config_page.clear_validation()
+
+    @Slot()
+    def restore_recommended_translation_config(self) -> None:
+        current = self.translation_config_page.current_config()
+        updated = with_recommended_values(current)
+        self.translation_config_draft = updated
+        self.translation_config_page.set_config(updated)
+        self.translation_config_page.clear_validation()
+
+    @Slot()
+    def validate_current_translation_config(self) -> None:
+        config = self.translation_config_page.current_config()
+        self.translation_config_draft = config
+        self.translation_config_page.show_validation(
+            validate_translation_config(config)
+        )
+
+    @Slot()
+    def save_translation_config_and_continue(self) -> None:
+        config = self.translation_config_page.current_config()
+        validation = validate_translation_config(config)
+        self.translation_config_draft = config
+        self.translation_config_page.show_validation(validation)
+        if not validation.valid:
+            return
+        self.translation_session_config = config
+        self.stage = WorkflowStage.TRIAL_TRANSLATION_PLACEHOLDER
+        self.pages.setCurrentWidget(self.trial_translation_page)
+        self.home_nav_button.setChecked(False)
+        self.footer_status.setText("翻译服务配置完成")
 
     def _choose_directory(self) -> str | None:
         selected = QFileDialog.getExistingDirectory(
