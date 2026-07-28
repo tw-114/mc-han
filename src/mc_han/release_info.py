@@ -5,14 +5,18 @@ import re
 from .version import get_version
 
 
-_ALPHA_VERSION = re.compile(r"^(?P<base>\d+\.\d+\.\d+)a(?P<number>\d+)$")
+_PRERELEASE_VERSION = re.compile(
+    r"^(?P<base>\d+\.\d+\.\d+)(?P<label>a|b)(?P<number>\d+)$"
+)
+_PRERELEASE_LABELS = {"a": "alpha", "b": "beta"}
 
 
 def release_tag(version: str | None = None) -> str:
     package_version = version or get_version()
-    match = _ALPHA_VERSION.fullmatch(package_version)
+    match = _PRERELEASE_VERSION.fullmatch(package_version)
     if match is not None:
-        package_version = f"{match.group('base')}-alpha.{match.group('number')}"
+        label = _PRERELEASE_LABELS[match.group("label")]
+        package_version = f"{match.group('base')}-{label}.{match.group('number')}"
     return f"v{package_version}"
 
 

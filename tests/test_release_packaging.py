@@ -29,13 +29,13 @@ def project_version() -> str:
 def test_package_runtime_and_release_names_use_one_version_source():
     expected = project_version()
 
-    assert expected == "0.7.0a2"
+    assert expected == "0.7.0b1"
     assert mc_han.__version__ == expected
     assert get_version() == expected
-    assert release_tag() == "v0.7.0-alpha.2"
-    assert windows_archive_name() == "mc-han-windows-x64-v0.7.0-alpha.2.zip"
+    assert release_tag() == "v0.7.0-beta.1"
+    assert windows_archive_name() == "mc-han-windows-x64-v0.7.0-beta.1.zip"
     assert windows_checksum_name() == (
-        "mc-han-windows-x64-v0.7.0-alpha.2.sha256"
+        "mc-han-windows-x64-v0.7.0-beta.1.sha256"
     )
     assert expected in about_text()
 
@@ -83,7 +83,7 @@ def test_windows_build_script_uses_derived_archive_name_and_audits_output():
 
 def test_release_notes_and_notices_describe_preview_boundary():
     notes = (
-        ROOT / "release-notes" / "v0.7.0-alpha.2.md"
+        ROOT / "release-notes" / "v0.7.0-beta.1.md"
     ).read_text(encoding="utf-8")
     notices = (ROOT / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
 
