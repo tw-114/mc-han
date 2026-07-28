@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.request
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
+
+from mc_han.usage.models import UsageOutcome
 
 from .base import TranslationSegment
 from .glossary import build_glossary_prompt, build_style_prompt
 from .protection import ProtectedText, protect_text
+from .usage import (
+    ProviderAttemptError,
+    ProviderAttemptResult,
+    normalize_usage,
+    response_request_id,
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +38,10 @@ PROVIDER_PRESETS = {
 
 
 class OpenAICompatibleTranslator:
+    is_network_provider = True
+    endpoint_type = "chat_completions"
+    thinking_mode = ""
+
     def __init__(
         self,
         *,
@@ -44,6 +58,12 @@ class OpenAICompatibleTranslator:
         self.timeout_seconds = timeout_seconds
 
     def translate_batch(self, segments: list[TranslationSegment]) -> list[str]:
+        return list(self.translate_batch_with_usage(segments).translations)
+
+    def translate_batch_with_usage(
+        self,
+        segments: list[TranslationSegment],
+    ) -> ProviderAttemptResult:
         protected_segments: list[tuple[TranslationSegment, ProtectedText]] = [
             (segment, protect_text(segment.text)) for segment in segments
         ]
@@ -74,20 +94,53 @@ class OpenAICompatibleTranslator:
             ],
             "response_format": {"type": "json_object"},
         }
-        response = self._post_json("/chat/completions", payload)
-        content = response["choices"][0]["message"]["content"]
-        parsed = parse_translation_response(content)
-        translations_by_id = {item["id"]: item["translation"] for item in parsed["translations"]}
+        response, headers = self._post_json("/chat/completions", payload)
+        usage = normalize_usage(response)
+        request_id = response_request_id(response, headers)
+        try:
+            content = response["choices"][0]["message"]["content"]
+            if not isinstance(content, str):
+                raise TypeError("response content must be a string")
+            parsed = parse_translation_response(content)
+            translations = parsed["translations"]
+            translations_by_id = {
+                item["id"]: item["translation"]
+                for item in translations
+                if isinstance(item, dict)
+            }
 
-        results: list[str] = []
-        for segment, protected in protected_segments:
-            translated = translations_by_id.get(segment.id)
-            if translated is None:
-                raise RuntimeError(f"Provider response omitted segment id {segment.id}")
-            results.append(protected.restore(translated))
-        return results
+            results: list[str] = []
+            for segment, protected in protected_segments:
+                translated = translations_by_id.get(segment.id)
+                if not isinstance(translated, str):
+                    raise ValueError("provider response omitted a segment")
+                results.append(protected.restore(translated))
+        except (
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            json.JSONDecodeError,
+        ) as error:
+            raise ProviderAttemptError(
+                outcome=UsageOutcome.INVALID_RESPONSE,
+                stable_error_code="invalid_translation_response",
+                retryable=True,
+                usage=usage,
+                provider_request_id=request_id,
+            ) from error
+        return ProviderAttemptResult(
+            translations=tuple(results),
+            usage=usage,
+            provider_request_id=request_id,
+        )
 
-    def _post_json(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+    def _post_json(
+        self,
+        path: str,
+        payload: dict[str, object],
+    ) -> tuple[dict[str, object], object]:
         request = urllib.request.Request(
             self.base_url + path,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -100,10 +153,75 @@ class OpenAICompatibleTranslator:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
+                body = response.read().decode("utf-8")
+                headers = response.headers
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                raise TypeError("response must be an object")
+            return parsed, headers
         except urllib.error.HTTPError as error:
-            body = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"{self.provider_name} API error {error.code}: {body}") from error
+            response_data = _safe_json_object(
+                error.read().decode("utf-8", errors="replace")
+            )
+            status = int(error.code)
+            outcome = (
+                UsageOutcome.RATE_LIMITED
+                if status == 429
+                else UsageOutcome.PROVIDER_ERROR
+            )
+            raise ProviderAttemptError(
+                outcome=outcome,
+                stable_error_code=(
+                    "http_rate_limited"
+                    if status == 429
+                    else f"http_{status}"
+                ),
+                retryable=status == 429 or status >= 500,
+                usage=normalize_usage(response_data),
+                provider_request_id=response_request_id(
+                    response_data,
+                    error.headers,
+                ),
+            ) from error
+        except (TimeoutError, socket.timeout) as error:
+            raise ProviderAttemptError(
+                outcome=UsageOutcome.TIMEOUT,
+                stable_error_code="request_timeout",
+                retryable=True,
+            ) from error
+        except CancelledError as error:
+            raise ProviderAttemptError(
+                outcome=UsageOutcome.CANCELLED,
+                stable_error_code="request_cancelled",
+                retryable=False,
+            ) from error
+        except urllib.error.URLError as error:
+            timed_out = isinstance(error.reason, (TimeoutError, socket.timeout))
+            raise ProviderAttemptError(
+                outcome=(
+                    UsageOutcome.TIMEOUT
+                    if timed_out
+                    else UsageOutcome.PROVIDER_ERROR
+                ),
+                stable_error_code=(
+                    "request_timeout"
+                    if timed_out
+                    else "network_error"
+                ),
+                retryable=True,
+            ) from error
+        except OSError as error:
+            raise ProviderAttemptError(
+                outcome=UsageOutcome.PROVIDER_ERROR,
+                stable_error_code="network_error",
+                retryable=True,
+            ) from error
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as error:
+            raise ProviderAttemptError(
+                outcome=UsageOutcome.INVALID_RESPONSE,
+                stable_error_code="invalid_json_response",
+                retryable=True,
+            ) from error
 
 
 def build_system_prompt() -> str:
@@ -132,3 +250,11 @@ def parse_translation_response(content: str) -> dict[str, object]:
     if not isinstance(parsed, dict) or not isinstance(parsed.get("translations"), list):
         raise RuntimeError("Provider did not return a translations array")
     return parsed
+
+
+def _safe_json_object(content: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}

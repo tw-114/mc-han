@@ -14,6 +14,7 @@ def test_project_paths_use_mc_han_state_directory(tmp_path):
     assert paths.state_dir == modpack.resolve() / ".mc-han"
     assert paths.extracted_jsonl.name == "extracted_texts.jsonl"
     assert paths.translations_sqlite.name == "translations.sqlite"
+    assert paths.usage_sqlite.name == "usage.sqlite3"
     assert paths.output_dir == paths.state_dir / "output"
     assert paths.state_dir.exists()
     assert paths.logs_dir.exists()

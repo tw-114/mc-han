@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, Sequence
 
 from .config import DEFAULT_NAME_TRANSLATION_FORMAT
+from .core.project import project_paths
 from .builder.installer import install_outputs, plan_install_outputs, rollback_install, write_install_plan_report
 from .builder.resourcepack import build_outputs, default_build_dir
 from .checkpoints import create_checkpoint, csv_status, list_checkpoints, rollback_checkpoint
@@ -23,6 +25,9 @@ from .settings import UserSettings, clear_settings, config_path, load_settings, 
 from .translator.engine import TranslationProgress, translate_csv
 from .translator.mock_provider import MockTranslator
 from .translator.openai_provider import OpenAICompatibleTranslator, PROVIDER_PRESETS
+from .usage.ledger import UsageLedger
+from .usage.service import UsageQueryService
+from .workflow.scan_models import CATEGORY_DEFINITIONS, ScanCategoryId
 from .workflow.models import ChineseResourceStatus, InspectionValidity, ModpackInspection
 
 CUSTOM_PROVIDER = "custom"
@@ -178,6 +183,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show translation progress and checkpoints for a CSV.",
     )
     status_parser.add_argument("csv", type=Path, help="CSV file to inspect.")
+
+    usage_parser = subparsers.add_parser(
+        "usage",
+        help="Show persisted translation API usage for a modpack.",
+    )
+    usage_parser.add_argument(
+        "modpack_dir",
+        type=Path,
+        help="Minecraft modpack directory.",
+    )
+    usage_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output machine-readable JSON.",
+    )
 
     rollback_parser = subparsers.add_parser(
         "rollback",
@@ -348,6 +369,7 @@ def run_translate(args: argparse.Namespace) -> int:
         continue_on_error=True,
         name_translation_format=options.name_translation_format or DEFAULT_NAME_TRANSLATION_FORMAT,
         progress_callback=progress_callback,
+        usage_ledger_path=project_paths(modpack_dir).usage_sqlite,
     )
     print(f"Translated {translated_count} row(s); cache hits {cache_hits}; total rows {len(records)}")
     print(f"Wrote {output_csv}")
@@ -513,6 +535,150 @@ def run_status(csv_path: Path) -> int:
     for info in checkpoints[-5:]:
         print(f"  {info.path.name}  {info.label}")
     return 0
+
+
+def run_usage(modpack_dir: Path, *, json_output: bool = False) -> int:
+    try:
+        ledger_path = project_paths(modpack_dir).usage_sqlite
+        ledger_exists = ledger_path.is_file()
+    except (OSError, RuntimeError):
+        return emit_usage_error(json_output=json_output)
+    if not ledger_exists:
+        payload = {
+            "status": "not_found",
+            "message": "尚无翻译 API 用量记录。",
+        }
+        if json_output:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(payload["message"], file=sys.stderr)
+        return 1
+    try:
+        with UsageLedger(ledger_path) as ledger:
+            service = UsageQueryService(ledger)
+            summary = service.project_summary()
+            payload = {
+                "status": "ok",
+                "summary": summary.to_dict(),
+                "breakdowns": {
+                    "provider": [
+                        item.to_dict()
+                        for item in service.breakdown_by_provider()
+                    ],
+                    "model": [
+                        item.to_dict()
+                        for item in service.breakdown_by_model()
+                    ],
+                    "category": [
+                        item.to_dict()
+                        for item in service.breakdown_by_category()
+                    ],
+                    "outcome": [
+                        item.to_dict()
+                        for item in service.breakdown_by_outcome()
+                    ],
+                },
+                "retry": service.retry_summary(),
+                "latency": service.latency_summary(),
+            }
+    except (
+        OSError,
+        sqlite3.DatabaseError,
+        ArithmeticError,
+        TypeError,
+        ValueError,
+    ):
+        return emit_usage_error(json_output=json_output)
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(format_usage_summary(payload))
+    return 0
+
+
+def emit_usage_error(*, json_output: bool) -> int:
+    payload = {
+        "status": "error",
+        "code": "usage_database_unreadable",
+        "message": "用量账本无法读取，请检查文件是否损坏。",
+    }
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(payload["message"], file=sys.stderr)
+    return 2
+
+
+def format_usage_summary(payload: dict[str, object]) -> str:
+    summary = payload["summary"]
+    assert isinstance(summary, dict)
+    breakdowns = payload["breakdowns"]
+    assert isinstance(breakdowns, dict)
+    category_breakdown = breakdowns.get("category", [])
+    reported_cost = summary["reported_cost"]
+    assert isinstance(reported_cost, dict)
+    lines = [
+        "翻译用量报告",
+        "",
+        f"API 请求：{summary['api_attempts']}",
+        f"成功：{summary['successful_attempts']}",
+        f"失败：{summary['failed_attempts']}",
+        f"重试：{summary['retry_count']}",
+        "",
+        f"输入 Token：{format_usage_value(summary['input_tokens'])}",
+        f"缓存命中 Token：{format_usage_value(summary['cached_input_tokens'])}",
+        f"输出 Token：{format_usage_value(summary['output_tokens'])}",
+        f"推理 Token：{format_usage_value(summary['reasoning_tokens'])}",
+        f"总 Token：{format_usage_value(summary['total_tokens'])}",
+        f"Token 信息不完整请求：{summary['incomplete_usage_count']}",
+        "",
+        f"缓存复用条目：{summary['reused_items']}",
+        f"API 新译条目：{summary['translated_items']}",
+        f"剩余条目：{summary['remaining_items']}",
+        "",
+        format_reported_cost(reported_cost),
+        (
+            f"估算费用：{summary['estimated_cost']} "
+            f"{summary['estimated_cost_currency']}"
+            if summary["estimated_cost"] is not None
+            else "估算费用：无法完整估算"
+        ),
+    ]
+    if summary["unmatched_pricing_count"]:
+        lines.append(
+            f"原因：{summary['unmatched_pricing_count']} 个请求没有匹配的价格配置"
+        )
+    if category_breakdown:
+        lines.extend(("", "按分类："))
+        for item in category_breakdown:
+            category_id = ScanCategoryId(item["key"])
+            title = CATEGORY_DEFINITIONS[category_id].title
+            lines.append(
+                f"{title}    {item['summary']['translated_items']} 条"
+            )
+    return "\n".join(lines)
+
+
+def format_usage_value(value: object) -> str:
+    return f"{value:,}" if isinstance(value, int) else "未返回"
+
+
+def format_reported_cost(reported_cost: dict[str, object]) -> str:
+    amount = reported_cost["amount"]
+    currency = reported_cost["currency"]
+    complete = reported_cost["complete"]
+    missing_count = reported_cost["missing_count"]
+    if amount is None:
+        if missing_count:
+            return f"服务商报告费用：未返回（{missing_count} 个请求未返回费用）"
+        return "服务商报告费用：无法合并"
+    label = "服务商报告费用总计" if complete else "服务商已报告费用小计"
+    suffix = (
+        f"；另有 {missing_count} 个请求未返回费用"
+        if missing_count
+        else ""
+    )
+    return f"{label}：{amount} {currency}{suffix}"
 
 
 def run_rollback(csv_path: Path, checkpoint: str) -> int:
@@ -713,6 +879,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_check(args.target, args.report)
     if args.command == "status":
         return run_status(args.csv)
+    if args.command == "usage":
+        return run_usage(args.modpack_dir, json_output=args.json_output)
     if args.command == "rollback":
         return run_rollback(args.csv, args.checkpoint)
     if args.command == "install":
