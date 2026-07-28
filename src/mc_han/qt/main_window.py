@@ -28,15 +28,14 @@ from mc_han.csv_store import read_extracted_csv
 from mc_han.qt.full_translation_view_models import (
     FullTranslationPageViewModel,
 )
+from mc_han.qt.pages.build_placeholder_page import BuildPlaceholderPage
 from mc_han.qt.pages.full_translation_page import FullTranslationPage
 from mc_han.qt.pages.home_page import HomePage
 from mc_han.qt.pages.inspection_page import InspectionPage
 from mc_han.qt.pages.scan_page import ScanPage
 from mc_han.qt.pages.translation_config_page import TranslationConfigPage
 from mc_han.qt.pages.trial_translation_page import TrialTranslationPage
-from mc_han.qt.pages.translation_check_placeholder_page import (
-    TranslationCheckPlaceholderPage,
-)
+from mc_han.qt.pages.translation_review_page import TranslationReviewPage
 from mc_han.qt.scan_view_models import ScanPageViewModel, ScanProgressViewModel
 from mc_han.qt.task_runner import (
     InspectionTask,
@@ -57,6 +56,9 @@ from mc_han.qt.translation_config_view_models import (
     create_translator,
 )
 from mc_han.qt.trial_view_models import TrialPageViewModel
+from mc_han.qt.translation_review_view_models import (
+    TranslationReviewPageViewModel,
+)
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
@@ -65,6 +67,11 @@ from mc_han.services.trial_translation import (
     TrialTranslationError,
     prepare_trial_samples,
     run_trial_translation,
+)
+from mc_han.services.translation_review import (
+    ReviewAction,
+    load_translation_review,
+    update_translation_review_record,
 )
 from mc_han.version import UNKNOWN_VERSION, get_version
 from mc_han.workflow.models import ModpackInspection
@@ -167,14 +174,16 @@ class MainWindow(QMainWindow):
         self.translation_config_page = TranslationConfigPage()
         self.trial_translation_page = TrialTranslationPage()
         self.full_translation_page = FullTranslationPage()
-        self.translation_check_page = TranslationCheckPlaceholderPage()
+        self.translation_review_page = TranslationReviewPage()
+        self.build_placeholder_page = BuildPlaceholderPage()
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
         self.pages.addWidget(self.scan_page)
         self.pages.addWidget(self.translation_config_page)
         self.pages.addWidget(self.trial_translation_page)
         self.pages.addWidget(self.full_translation_page)
-        self.pages.addWidget(self.translation_check_page)
+        self.pages.addWidget(self.translation_review_page)
+        self.pages.addWidget(self.build_placeholder_page)
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
@@ -236,8 +245,29 @@ class MainWindow(QMainWindow):
         self.full_translation_page.retry_requested.connect(
             self.retry_failed_full_translation
         )
-        self.translation_check_page.back_requested.connect(
+        self.translation_review_page.back_requested.connect(
             self.show_full_translation_result
+        )
+        self.translation_review_page.save_requested.connect(
+            self.save_review_translation
+        )
+        self.translation_review_page.approve_requested.connect(
+            self.approve_review_record
+        )
+        self.translation_review_page.needs_retranslate_requested.connect(
+            self.mark_review_record_for_retranslation
+        )
+        self.translation_review_page.skip_requested.connect(
+            self.skip_review_record
+        )
+        self.translation_review_page.retranslate_placeholder_requested.connect(
+            self.show_retranslate_placeholder
+        )
+        self.translation_review_page.continue_requested.connect(
+            self.show_build_placeholder
+        )
+        self.build_placeholder_page.back_requested.connect(
+            self.show_translation_review
         )
         self.home_nav_button.clicked.connect(self.show_home)
         self.show_home()
@@ -854,9 +884,7 @@ class MainWindow(QMainWindow):
         self.full_translation_page.show_result(view_model)
         self.footer_status.setText("完整翻译任务结束")
         if view_model.is_complete:
-            self.stage = WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER
-            self.pages.setCurrentWidget(self.translation_check_page)
-            self.footer_status.setText("准备检查译文")
+            self.show_translation_review()
         self._close_if_pending()
 
     @Slot(object)
@@ -887,6 +915,118 @@ class MainWindow(QMainWindow):
     @Slot()
     def show_full_translation_result(self) -> None:
         self._show_full_translation_page()
+
+    @Slot()
+    def show_translation_review(self) -> None:
+        self.stage = WorkflowStage.TRANSLATION_REVIEW
+        self.pages.setCurrentWidget(self.translation_review_page)
+        self.home_nav_button.setChecked(False)
+        self.footer_status.setText("检查译文")
+        if self.current_inspection is None:
+            self.translation_review_page.show_load_failure(
+                "无法确定当前整合包，请返回并重新选择项目。"
+            )
+            return
+        try:
+            records, issues = load_translation_review(
+                project_paths(
+                    self.current_inspection.input_directory
+                ).extracted_csv
+            )
+        except (OSError, UnicodeError, ValueError):
+            self.translation_review_page.show_load_failure(
+                "无法读取译文清单，原有文件没有被修改。"
+            )
+            return
+        self.translation_review_page.show_review(
+            TranslationReviewPageViewModel.from_data(records, issues)
+        )
+
+    @Slot(str, str)
+    def save_review_translation(
+        self,
+        record_id: str,
+        translation: str,
+    ) -> None:
+        self._apply_review_action(
+            record_id,
+            ReviewAction.EDIT,
+            translation=translation,
+            success_message="译文已保存，检查结果已刷新。",
+        )
+
+    @Slot(str)
+    def approve_review_record(self, record_id: str) -> None:
+        self._apply_review_action(
+            record_id,
+            ReviewAction.APPROVE,
+            success_message="已标记为审核通过。",
+        )
+
+    @Slot(str)
+    def mark_review_record_for_retranslation(
+        self,
+        record_id: str,
+    ) -> None:
+        self._apply_review_action(
+            record_id,
+            ReviewAction.NEEDS_RETRANSLATE,
+            success_message="已标记为需要重译，本轮不会调用 API。",
+        )
+
+    @Slot(str)
+    def skip_review_record(self, record_id: str) -> None:
+        self._apply_review_action(
+            record_id,
+            ReviewAction.SKIP,
+            success_message="已跳过该条目。",
+        )
+
+    def _apply_review_action(
+        self,
+        record_id: str,
+        action: ReviewAction,
+        *,
+        translation: str = "",
+        success_message: str,
+    ) -> None:
+        if self.current_inspection is None:
+            return
+        csv_path = project_paths(
+            self.current_inspection.input_directory
+        ).extracted_csv
+        try:
+            update_translation_review_record(
+                csv_path,
+                record_id,
+                action,
+                translation=translation,
+            )
+            records, issues = load_translation_review(csv_path)
+        except (OSError, UnicodeError, ValueError):
+            self.translation_review_page.show_feedback(
+                "保存失败，原有译文清单已经保留。",
+                error=True,
+            )
+            return
+        self.translation_review_page.show_review(
+            TranslationReviewPageViewModel.from_data(records, issues),
+            selected_id=record_id,
+        )
+        self.translation_review_page.show_feedback(success_message)
+
+    @Slot(str)
+    def show_retranslate_placeholder(self, _record_id: str) -> None:
+        self.translation_review_page.show_feedback(
+            "重新翻译当前项将在下一批接入，本轮没有调用 API。"
+        )
+
+    @Slot()
+    def show_build_placeholder(self) -> None:
+        self.stage = WorkflowStage.BUILD_PLACEHOLDER
+        self.pages.setCurrentWidget(self.build_placeholder_page)
+        self.home_nav_button.setChecked(False)
+        self.footer_status.setText("准备生成资源包")
 
     def _show_full_translation_page(self) -> None:
         self.stage = WorkflowStage.FULL_TRANSLATION

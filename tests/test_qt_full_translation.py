@@ -297,7 +297,7 @@ def test_full_translation_uses_existing_engine_after_user_click(
         application,
         lambda: (
             window.stage
-            is WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER
+            is WorkflowStage.TRANSLATION_REVIEW
         ),
     )
 
@@ -354,7 +354,7 @@ def test_retry_only_sends_failed_records_to_existing_engine(
         application,
         lambda: (
             window.stage
-            is WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER
+            is WorkflowStage.TRANSLATION_REVIEW
         ),
     )
 
@@ -385,6 +385,6 @@ def test_completed_trial_selection_skips_full_provider(
     assert provider.calls == []
     assert (
         window.stage
-        is WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER
+        is WorkflowStage.TRANSLATION_REVIEW
     )
     _close_window(application, window)
