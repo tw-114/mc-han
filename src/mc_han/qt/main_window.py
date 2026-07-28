@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import QThreadPool, QTimer, Qt, Slot
 from PySide6.QtGui import QCloseEvent, QGuiApplication
@@ -24,11 +26,14 @@ from mc_han.qt.pages.home_page import HomePage
 from mc_han.qt.pages.inspection_page import InspectionPage
 from mc_han.qt.pages.scan_page import ScanPage
 from mc_han.qt.pages.translation_config_page import TranslationConfigPage
-from mc_han.qt.pages.trial_translation_placeholder_page import (
-    TrialTranslationPlaceholderPage,
-)
+from mc_han.qt.pages.trial_translation_page import TrialTranslationPage
 from mc_han.qt.scan_view_models import ScanPageViewModel, ScanProgressViewModel
-from mc_han.qt.task_runner import InspectionTask, ScanTask, TaskFailure
+from mc_han.qt.task_runner import (
+    InspectionTask,
+    ScanTask,
+    TaskFailure,
+    TrialTranslationTask,
+)
 from mc_han.qt.theme import application_stylesheet
 from mc_han.qt.translation_config_view_models import (
     TranslationConfigPageViewModel,
@@ -38,10 +43,16 @@ from mc_han.qt.translation_config_view_models import (
     validate_translation_config,
     with_recommended_values,
 )
+from mc_han.qt.trial_view_models import TrialPageViewModel
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
 from mc_han.services.scan_service import scan_and_classify
+from mc_han.services.trial_translation import (
+    TrialTranslationError,
+    prepare_trial_samples,
+    run_trial_translation,
+)
 from mc_han.version import UNKNOWN_VERSION, get_version
 from mc_han.workflow.models import ModpackInspection
 from mc_han.workflow.scan_models import (
@@ -50,11 +61,21 @@ from mc_han.workflow.scan_models import (
     ScanProgressEvent,
     ScanSelectionState,
 )
+from mc_han.workflow.trial_models import (
+    TrialProgressEvent,
+    TrialSampleResult,
+    TrialTranslationResult,
+)
 
 
 DirectoryPicker = Callable[[], str | None]
 InspectionService = Callable[[Path], ModpackInspection]
 ScanService = Callable[..., ScanClassificationResult]
+TrialPrepareService = Callable[
+    [Path, ScanSelectionState],
+    tuple[TrialSampleResult, ...],
+]
+TrialService = Callable[..., TrialTranslationResult]
 
 
 class MainWindow(QMainWindow):
@@ -63,17 +84,24 @@ class MainWindow(QMainWindow):
         *,
         inspection_service: InspectionService = inspect_modpack,
         scan_service: ScanService = scan_and_classify,
+        trial_prepare_service: TrialPrepareService = prepare_trial_samples,
+        trial_service: TrialService = run_trial_translation,
         directory_picker: DirectoryPicker | None = None,
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
         self._scan_service = scan_service
+        self._trial_prepare_service = trial_prepare_service
+        self._trial_service = trial_service
         self._directory_picker = directory_picker or self._choose_directory
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
-        self._active_task: InspectionTask | ScanTask | None = None
+        self._active_task: (
+            InspectionTask | ScanTask | TrialTranslationTask | None
+        ) = None
         self._inspection_running = False
         self._scan_running = False
+        self._trial_running = False
         self._close_when_idle = False
         self._close_scheduled = False
         self.current_inspection: ModpackInspection | None = None
@@ -81,6 +109,9 @@ class MainWindow(QMainWindow):
         self.scan_selection: ScanSelectionState | None = None
         self.translation_config_draft: TranslationSessionConfig | None = None
         self.translation_session_config: TranslationSessionConfig | None = None
+        self.trial_samples: tuple[TrialSampleResult, ...] = ()
+        self.trial_result: TrialTranslationResult | None = None
+        self._trial_task_id = ""
         self.stage = WorkflowStage.WELCOME
 
         self.setWindowTitle("mc-han")
@@ -100,7 +131,7 @@ class MainWindow(QMainWindow):
         self.inspection_page = InspectionPage()
         self.scan_page = ScanPage()
         self.translation_config_page = TranslationConfigPage()
-        self.trial_translation_page = TrialTranslationPlaceholderPage()
+        self.trial_translation_page = TrialTranslationPage()
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
         self.pages.addWidget(self.scan_page)
@@ -142,6 +173,15 @@ class MainWindow(QMainWindow):
         )
         self.trial_translation_page.back_requested.connect(
             self.show_translation_config
+        )
+        self.trial_translation_page.start_requested.connect(
+            self.start_trial_translation
+        )
+        self.trial_translation_page.retry_requested.connect(
+            self.retry_failed_trial_samples
+        )
+        self.trial_translation_page.continue_requested.connect(
+            self.confirm_trial_translation
         )
         self.home_nav_button.clicked.connect(self.show_home)
         self.show_home()
@@ -212,20 +252,23 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def choose_and_inspect(self) -> None:
-        if self._close_when_idle or self._inspection_running or self._scan_running:
+        if self._task_running() or self._close_when_idle:
             return
         selected = self._directory_picker()
         if selected:
             self.start_inspection(Path(selected))
 
     def start_inspection(self, path: Path) -> None:
-        if self._close_when_idle or self._inspection_running or self._scan_running:
+        if self._task_running() or self._close_when_idle:
             return
         self._inspection_running = True
         self.current_scan_result = None
         self.scan_selection = None
         self.translation_config_draft = None
         self.translation_session_config = None
+        self.trial_samples = ()
+        self.trial_result = None
+        self._trial_task_id = ""
         self.stage = WorkflowStage.INSPECTING
         self.home_page.select_button.setEnabled(False)
         self.inspection_page.show_loading()
@@ -265,7 +308,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def start_scan(self) -> None:
-        if self._close_when_idle or self._inspection_running or self._scan_running:
+        if self._task_running() or self._close_when_idle:
             return
         inspection = self.current_inspection
         if inspection is None or not inspection.can_continue:
@@ -362,7 +405,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def show_home(self) -> None:
-        if self._inspection_running or self._scan_running:
+        if self._task_running():
             return
         self.stage = WorkflowStage.WELCOME
         self.pages.setCurrentWidget(self.home_page)
@@ -456,10 +499,128 @@ class MainWindow(QMainWindow):
         if not validation.valid:
             return
         self.translation_session_config = config
-        self.stage = WorkflowStage.TRIAL_TRANSLATION_PLACEHOLDER
+        if self.current_inspection is None or self.scan_selection is None:
+            return
+        try:
+            samples = self._trial_prepare_service(
+                self.current_inspection.input_directory,
+                self.scan_selection,
+            )
+        except TrialTranslationError:
+            self.trial_samples = ()
+            self.trial_result = None
+            self._trial_task_id = ""
+            self.trial_translation_page.show_ready(
+                TrialPageViewModel.ready(())
+            )
+            self.trial_translation_page.show_failure(
+                "无法准备试译样本，请返回扫描页面重新扫描。",
+                can_retry=False,
+            )
+        else:
+            self.trial_samples = samples
+            self.trial_result = None
+            self._trial_task_id = f"trial-{uuid4().hex}"
+            self.trial_translation_page.show_ready(
+                TrialPageViewModel.ready(samples)
+            )
+        self.stage = WorkflowStage.TRIAL_TRANSLATION
         self.pages.setCurrentWidget(self.trial_translation_page)
         self.home_nav_button.setChecked(False)
-        self.footer_status.setText("翻译服务配置完成")
+        self.footer_status.setText("等待确认试译")
+
+    @Slot()
+    def start_trial_translation(self) -> None:
+        self._start_trial(target_ids=None)
+
+    @Slot()
+    def retry_failed_trial_samples(self) -> None:
+        if self.trial_result is None or not self.trial_result.failed_ids:
+            return
+        self._start_trial(target_ids=self.trial_result.failed_ids)
+
+    def _start_trial(
+        self,
+        *,
+        target_ids: frozenset[str] | None,
+    ) -> None:
+        if self._task_running() or self._close_when_idle:
+            return
+        if (
+            self.current_inspection is None
+            or self.translation_session_config is None
+            or not self.trial_samples
+            or not self._trial_task_id
+        ):
+            return
+        self._trial_running = True
+        self.trial_translation_page.show_running(
+            retry=target_ids is not None
+        )
+        self.footer_status.setText("正在进行小批量试译")
+        task = TrialTranslationTask(
+            self.current_inspection.input_directory,
+            self.translation_session_config,
+            self.trial_samples,
+            self._trial_service,
+            task_id=self._trial_task_id,
+            target_ids=target_ids,
+        )
+        task.signals.progress.connect(self._trial_progress)
+        task.signals.completed.connect(self._trial_completed)
+        task.signals.failed.connect(self._trial_failed)
+        self._active_task = task
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _trial_progress(self, event: TrialProgressEvent) -> None:
+        if self._trial_running:
+            self.trial_translation_page.update_progress(event)
+
+    @Slot(object)
+    def _trial_completed(self, result: TrialTranslationResult) -> None:
+        self._trial_running = False
+        self._active_task = None
+        if self.trial_result is not None:
+            result = replace(
+                result,
+                elapsed_seconds=(
+                    self.trial_result.elapsed_seconds
+                    + result.elapsed_seconds
+                ),
+            )
+        self.trial_result = result
+        self.trial_samples = result.samples
+        self.trial_translation_page.show_result(
+            TrialPageViewModel.from_result(result)
+        )
+        self.footer_status.setText("试译完成")
+        self._close_if_pending()
+
+    @Slot(object)
+    def _trial_failed(self, failure: TaskFailure) -> None:
+        self._trial_running = False
+        self._active_task = None
+        can_retry = bool(
+            self.trial_result is not None
+            and self.trial_result.failed_ids
+        )
+        self.trial_translation_page.show_failure(
+            failure.message,
+            can_retry=can_retry,
+        )
+        self.footer_status.setText("试译未完成")
+        self._close_if_pending()
+
+    @Slot()
+    def confirm_trial_translation(self) -> None:
+        if self._trial_running or self.trial_result is None:
+            return
+        if self.trial_result.successful_count == 0:
+            return
+        self.stage = WorkflowStage.FULL_TRANSLATION_PLACEHOLDER
+        self.trial_translation_page.show_confirmed()
+        self.footer_status.setText("试译结果已确认")
 
     def _choose_directory(self) -> str | None:
         selected = QFileDialog.getExistingDirectory(
@@ -471,13 +632,13 @@ class MainWindow(QMainWindow):
         return selected or None
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._inspection_running or self._scan_running:
+        if self._task_running():
             event.ignore()
             if not self._close_when_idle:
                 self._close_when_idle = True
                 self._disable_task_starters_for_pending_close()
                 self.footer_status.setText(
-                    "正在安全结束当前扫描，完成后将自动关闭"
+                    self._pending_close_message()
                 )
             # This keeps the event loop responsive until the read-only worker
             # returns. A future batch can add cooperative cancellation checks;
@@ -493,6 +654,13 @@ class MainWindow(QMainWindow):
         self.inspection_page.start_scan_button.setEnabled(False)
         self.scan_page.rescan_button.setEnabled(False)
         self.scan_page.continue_button.setEnabled(False)
+        self.translation_config_page.back_button.setEnabled(False)
+        self.translation_config_page.validate_button.setEnabled(False)
+        self.translation_config_page.continue_button.setEnabled(False)
+        self.trial_translation_page.back_button.setEnabled(False)
+        self.trial_translation_page.start_button.setEnabled(False)
+        self.trial_translation_page.retry_button.setEnabled(False)
+        self.trial_translation_page.continue_button.setEnabled(False)
 
     def _close_if_pending(self) -> None:
         if not self._close_when_idle or self._close_scheduled:
@@ -500,9 +668,21 @@ class MainWindow(QMainWindow):
         self._close_scheduled = True
         self._disable_task_starters_for_pending_close()
         self.footer_status.setText(
-            "正在安全结束当前扫描，完成后将自动关闭"
+            self._pending_close_message()
         )
         QTimer.singleShot(0, self.close)
+
+    def _task_running(self) -> bool:
+        return (
+            self._inspection_running
+            or self._scan_running
+            or self._trial_running
+        )
+
+    def _pending_close_message(self) -> str:
+        if self._trial_running:
+            return "正在安全结束当前试译，完成后将自动关闭"
+        return "正在安全结束当前扫描，完成后将自动关闭"
 
 
 def run_qt_app(

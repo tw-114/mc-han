@@ -180,13 +180,13 @@ def test_validation_and_save_enter_trial_placeholder_without_writing_config(
 
     window.save_translation_config_and_continue()
 
-    assert window.stage is WorkflowStage.TRIAL_TRANSLATION_PLACEHOLDER
+    assert window.stage is WorkflowStage.TRIAL_TRANSLATION
     assert window.pages.currentWidget() is window.trial_translation_page
     labels = {
         label.text()
         for label in window.trial_translation_page.findChildren(QLabel)
     }
-    assert "配置已完成，下一步将进行小批量试译。" in labels
+    assert "小批量试译" in labels
     assert window.translation_session_config is not None
     assert window.translation_session_config.api_key == "sk-session-only"
     assert not config_path.exists()
