@@ -3,12 +3,21 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
+from threading import Event
+from time import perf_counter
 
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
+from mc_han.core.project import project_paths
 from mc_han.qt.translation_config_view_models import TranslationSessionConfig
+from mc_han.qt.translation_config_view_models import create_translator
 from mc_han.services.scan_service import ScanServiceError
 from mc_han.services.trial_translation import TrialTranslationError
+from mc_han.translator.engine import TranslationProgress, translate_csv
+from mc_han.usage.ledger import UsageLedger
+from mc_han.usage.models import TranslationUsageSummary
+from mc_han.usage.service import UsageQueryService
 from mc_han.workflow.models import ExistingChineseResources, ModpackInspection
 from mc_han.workflow.scan_models import (
     ScanClassificationResult,
@@ -196,3 +205,146 @@ class TrialTranslationTask(QRunnable):
         if not isinstance(event, TrialProgressEvent):
             raise TypeError("trial progress callback received an invalid event")
         self.signals.progress.emit(event)
+
+
+@dataclass(frozen=True)
+class FullTranslationTaskResult:
+    total_count: int
+    successful_count: int
+    failed_ids: frozenset[str]
+    remaining_ids: frozenset[str]
+    usage: TranslationUsageSummary
+    elapsed_seconds: float
+    task_id: str
+
+    @property
+    def remaining_count(self) -> int:
+        return len(self.remaining_ids)
+
+
+class FullTranslationTaskSignals(QObject):
+    progress = Signal(object)
+    translation_event = Signal(object)
+    completed = Signal(object)
+    failed = Signal(object)
+
+
+class FullTranslationTask(QRunnable):
+    """Qt adapter around the existing translation engine."""
+
+    def __init__(
+        self,
+        path: Path,
+        config: TranslationSessionConfig,
+        *,
+        selected_ids: frozenset[str],
+        target_ids: frozenset[str],
+        task_id: str,
+        translator_factory: Callable[[TranslationSessionConfig], object] = (
+            create_translator
+        ),
+    ) -> None:
+        super().__init__()
+        self._path = Path(path)
+        self._config = config
+        self._selected_ids = frozenset(selected_ids)
+        self._target_ids = frozenset(target_ids)
+        self._task_id = task_id
+        self._translator_factory = translator_factory
+        self._pause_event = Event()
+        self._stop_event = Event()
+        self.signals = FullTranslationTaskSignals()
+        self.setAutoDelete(True)
+
+    def pause(self) -> None:
+        self._pause_event.set()
+
+    def resume(self) -> None:
+        self._pause_event.clear()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+        self._pause_event.clear()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_event.is_set()
+
+    @Slot()
+    def run(self) -> None:
+        paths = project_paths(self._path)
+        started = perf_counter()
+        try:
+            translator = self._translator_factory(self._config)
+            records, _translated_count, _cache_hits = translate_csv(
+                input_csv=paths.extracted_csv,
+                output_csv=paths.extracted_csv,
+                translator=translator,
+                cache_path=paths.translation_cache_jsonl,
+                sqlite_cache_path=paths.translations_sqlite,
+                usage_ledger_path=paths.usage_sqlite,
+                usage_task_id=self._task_id,
+                target_ids=set(self._target_ids),
+                worker_count=self._config.concurrency,
+                max_batch_items=self._config.batch_size,
+                pause_event=self._pause_event,
+                stop_event=self._stop_event,
+                continue_on_error=True,
+                progress_callback=self._emit_progress,
+                event_callback=self.signals.translation_event.emit,
+            )
+        except (OSError, sqlite3.Error, RuntimeError, TypeError, ValueError) as error:
+            self.signals.failed.emit(
+                TaskFailure(
+                    code="full_translation_failed",
+                    message=(
+                        "完整翻译未能继续，已完成批次已经保存，"
+                        "可稍后继续。"
+                    ),
+                    detail=type(error).__name__,
+                    retryable=True,
+                    partial_saved=True,
+                )
+            )
+            return
+
+        selected_records = tuple(
+            record for record in records if record.id in self._selected_ids
+        )
+        successful_count = sum(
+            bool(record.translation.strip()) for record in selected_records
+        )
+        failed_ids = frozenset(
+            record.id
+            for record in selected_records
+            if not record.translation.strip()
+            and record.note.casefold().startswith("failed")
+        )
+        remaining_ids = frozenset(
+            record.id
+            for record in selected_records
+            if not record.translation.strip() and record.id not in failed_ids
+        )
+        try:
+            with UsageLedger(paths.usage_sqlite) as ledger:
+                usage = UsageQueryService(ledger).task_summary(self._task_id)
+        except (OSError, sqlite3.Error, ValueError):
+            usage = TranslationUsageSummary()
+        self.signals.completed.emit(
+            FullTranslationTaskResult(
+                total_count=len(self._selected_ids),
+                successful_count=successful_count,
+                failed_ids=failed_ids,
+                remaining_ids=remaining_ids,
+                usage=usage,
+                elapsed_seconds=perf_counter() - started,
+                task_id=self._task_id,
+            )
+        )
+
+    def _emit_progress(self, progress: TranslationProgress) -> None:
+        if not isinstance(progress, TranslationProgress):
+            raise TypeError(
+                "translation progress callback received an invalid event"
+            )
+        self.signals.progress.emit(progress)

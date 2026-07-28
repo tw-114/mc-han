@@ -270,7 +270,7 @@ def test_retry_from_qt_passes_only_failed_ids(
     assert calls == [None, failed_ids]
     assert window.trial_result.failed_count == 0
     window.confirm_trial_translation()
-    assert window.stage is WorkflowStage.FULL_TRANSLATION_PLACEHOLDER
+    assert window.stage is WorkflowStage.FULL_TRANSLATION
     _close_window(application, window)
 
 

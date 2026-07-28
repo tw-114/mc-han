@@ -4,6 +4,7 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 from uuid import uuid4
 
 from PySide6.QtCore import QThreadPool, QTimer, Qt, Slot
@@ -22,14 +23,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mc_han.core.project import project_paths
+from mc_han.csv_store import read_extracted_csv
+from mc_han.qt.full_translation_view_models import (
+    FullTranslationPageViewModel,
+)
+from mc_han.qt.pages.full_translation_page import FullTranslationPage
 from mc_han.qt.pages.home_page import HomePage
 from mc_han.qt.pages.inspection_page import InspectionPage
 from mc_han.qt.pages.scan_page import ScanPage
 from mc_han.qt.pages.translation_config_page import TranslationConfigPage
 from mc_han.qt.pages.trial_translation_page import TrialTranslationPage
+from mc_han.qt.pages.translation_check_placeholder_page import (
+    TranslationCheckPlaceholderPage,
+)
 from mc_han.qt.scan_view_models import ScanPageViewModel, ScanProgressViewModel
 from mc_han.qt.task_runner import (
     InspectionTask,
+    FullTranslationTask,
+    FullTranslationTaskResult,
     ScanTask,
     TaskFailure,
     TrialTranslationTask,
@@ -42,6 +54,7 @@ from mc_han.qt.translation_config_view_models import (
     recommended_translation_config,
     validate_translation_config,
     with_recommended_values,
+    create_translator,
 )
 from mc_han.qt.trial_view_models import TrialPageViewModel
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
@@ -56,11 +69,15 @@ from mc_han.services.trial_translation import (
 from mc_han.version import UNKNOWN_VERSION, get_version
 from mc_han.workflow.models import ModpackInspection
 from mc_han.workflow.scan_models import (
+    CATEGORY_DEFINITIONS,
+    SOURCE_TYPE_TO_CATEGORY,
     ScanCategoryId,
     ScanClassificationResult,
     ScanProgressEvent,
     ScanSelectionState,
 )
+from mc_han.translator.engine import TranslationProgress, TranslationStarted
+from mc_han.usage.models import TranslationUsageSummary
 from mc_han.workflow.trial_models import (
     TrialProgressEvent,
     TrialSampleResult,
@@ -76,6 +93,7 @@ TrialPrepareService = Callable[
     tuple[TrialSampleResult, ...],
 ]
 TrialService = Callable[..., TrialTranslationResult]
+FullTranslatorFactory = Callable[[TranslationSessionConfig], object]
 
 
 class MainWindow(QMainWindow):
@@ -86,6 +104,7 @@ class MainWindow(QMainWindow):
         scan_service: ScanService = scan_and_classify,
         trial_prepare_service: TrialPrepareService = prepare_trial_samples,
         trial_service: TrialService = run_trial_translation,
+        full_translator_factory: FullTranslatorFactory = create_translator,
         directory_picker: DirectoryPicker | None = None,
     ) -> None:
         super().__init__()
@@ -93,15 +112,21 @@ class MainWindow(QMainWindow):
         self._scan_service = scan_service
         self._trial_prepare_service = trial_prepare_service
         self._trial_service = trial_service
+        self._full_translator_factory = full_translator_factory
         self._directory_picker = directory_picker or self._choose_directory
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
         self._active_task: (
-            InspectionTask | ScanTask | TrialTranslationTask | None
+            InspectionTask
+            | ScanTask
+            | TrialTranslationTask
+            | FullTranslationTask
+            | None
         ) = None
         self._inspection_running = False
         self._scan_running = False
         self._trial_running = False
+        self._full_running = False
         self._close_when_idle = False
         self._close_scheduled = False
         self.current_inspection: ModpackInspection | None = None
@@ -112,6 +137,15 @@ class MainWindow(QMainWindow):
         self.trial_samples: tuple[TrialSampleResult, ...] = ()
         self.trial_result: TrialTranslationResult | None = None
         self._trial_task_id = ""
+        self._full_task: FullTranslationTask | None = None
+        self._full_selected_ids: frozenset[str] = frozenset()
+        self._full_pending_ids: frozenset[str] = frozenset()
+        self._full_result: FullTranslationTaskResult | None = None
+        self._full_task_id = ""
+        self._full_current_category = ""
+        self._full_translated_before_run = 0
+        self._full_elapsed_previous = 0.0
+        self._full_started_at = 0.0
         self.stage = WorkflowStage.WELCOME
 
         self.setWindowTitle("mc-han")
@@ -132,11 +166,15 @@ class MainWindow(QMainWindow):
         self.scan_page = ScanPage()
         self.translation_config_page = TranslationConfigPage()
         self.trial_translation_page = TrialTranslationPage()
+        self.full_translation_page = FullTranslationPage()
+        self.translation_check_page = TranslationCheckPlaceholderPage()
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
         self.pages.addWidget(self.scan_page)
         self.pages.addWidget(self.translation_config_page)
         self.pages.addWidget(self.trial_translation_page)
+        self.pages.addWidget(self.full_translation_page)
+        self.pages.addWidget(self.translation_check_page)
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
@@ -182,6 +220,24 @@ class MainWindow(QMainWindow):
         )
         self.trial_translation_page.continue_requested.connect(
             self.confirm_trial_translation
+        )
+        self.full_translation_page.back_requested.connect(
+            self.show_trial_translation_result
+        )
+        self.full_translation_page.start_requested.connect(
+            self.start_full_translation
+        )
+        self.full_translation_page.pause_requested.connect(
+            self.pause_full_translation
+        )
+        self.full_translation_page.resume_requested.connect(
+            self.resume_full_translation
+        )
+        self.full_translation_page.retry_requested.connect(
+            self.retry_failed_full_translation
+        )
+        self.translation_check_page.back_requested.connect(
+            self.show_full_translation_result
         )
         self.home_nav_button.clicked.connect(self.show_home)
         self.show_home()
@@ -269,6 +325,7 @@ class MainWindow(QMainWindow):
         self.trial_samples = ()
         self.trial_result = None
         self._trial_task_id = ""
+        self._clear_full_translation_state()
         self.stage = WorkflowStage.INSPECTING
         self.home_page.select_button.setEnabled(False)
         self.inspection_page.show_loading()
@@ -618,9 +675,224 @@ class MainWindow(QMainWindow):
             return
         if self.trial_result.successful_count == 0:
             return
-        self.stage = WorkflowStage.FULL_TRANSLATION_PLACEHOLDER
-        self.trial_translation_page.show_confirmed()
-        self.footer_status.setText("试译结果已确认")
+        if self.current_inspection is None or self.scan_selection is None:
+            return
+        try:
+            records = read_extracted_csv(
+                project_paths(
+                    self.current_inspection.input_directory
+                ).extracted_csv
+            )
+        except (OSError, UnicodeError, ValueError):
+            self.full_translation_page.show_failure(
+                "无法读取扫描清单，请返回扫描页面重新扫描。"
+            )
+            self._show_full_translation_page()
+            return
+        selected = tuple(
+            record
+            for record in self.scan_selection.selected_records(records)
+            if record.original.strip() and not record.skip_status.strip()
+        )
+        self._full_selected_ids = frozenset(
+            record.id for record in selected
+        )
+        translated = frozenset(
+            record.id
+            for record in selected
+            if record.translation.strip()
+        )
+        self._full_pending_ids = self._full_selected_ids - translated
+        self._full_result = None
+        self._full_task_id = f"full-{uuid4().hex}"
+        self._full_current_category = ""
+        self._full_elapsed_previous = 0.0
+        self.full_translation_page.show_ready(
+            FullTranslationPageViewModel.ready(
+                total_count=len(self._full_selected_ids),
+                translated_count=len(translated),
+            )
+        )
+        self._show_full_translation_page()
+        if self._full_selected_ids and not self._full_pending_ids:
+            self._full_completed(
+                FullTranslationTaskResult(
+                    total_count=len(self._full_selected_ids),
+                    successful_count=len(self._full_selected_ids),
+                    failed_ids=frozenset(),
+                    remaining_ids=frozenset(),
+                    usage=TranslationUsageSummary(),
+                    elapsed_seconds=0.0,
+                    task_id=self._full_task_id,
+                )
+            )
+
+    @Slot()
+    def show_trial_translation_result(self) -> None:
+        if self._full_running:
+            return
+        self.stage = WorkflowStage.TRIAL_TRANSLATION
+        self.pages.setCurrentWidget(self.trial_translation_page)
+        self.home_nav_button.setChecked(False)
+        self.footer_status.setText("试译完成")
+
+    @Slot()
+    def start_full_translation(self) -> None:
+        self._start_full_translation(self._full_pending_ids)
+
+    @Slot()
+    def retry_failed_full_translation(self) -> None:
+        if self._full_result is None or not self._full_result.failed_ids:
+            return
+        self._start_full_translation(self._full_result.failed_ids)
+
+    def _start_full_translation(
+        self,
+        target_ids: frozenset[str],
+    ) -> None:
+        if self._task_running() or self._close_when_idle:
+            return
+        if (
+            self.current_inspection is None
+            or self.translation_session_config is None
+            or not self._full_selected_ids
+            or not target_ids
+        ):
+            return
+        paths = project_paths(self.current_inspection.input_directory)
+        try:
+            current_records = read_extracted_csv(paths.extracted_csv)
+        except (OSError, UnicodeError, ValueError):
+            self.full_translation_page.show_failure(
+                "无法读取扫描清单，请返回扫描页面重新扫描。"
+            )
+            return
+        self._full_translated_before_run = sum(
+            record.id in self._full_selected_ids
+            and bool(record.translation.strip())
+            for record in current_records
+        )
+        self._full_running = True
+        self._full_started_at = perf_counter()
+        self.full_translation_page.show_running(
+            retry=(
+                self._full_result is not None
+                and target_ids == self._full_result.failed_ids
+            )
+        )
+        self.footer_status.setText("正在进行完整翻译")
+        task = FullTranslationTask(
+            self.current_inspection.input_directory,
+            self.translation_session_config,
+            selected_ids=self._full_selected_ids,
+            target_ids=target_ids,
+            task_id=self._full_task_id,
+            translator_factory=self._full_translator_factory,
+        )
+        task.signals.progress.connect(self._full_progress)
+        task.signals.translation_event.connect(
+            self._full_translation_event
+        )
+        task.signals.completed.connect(self._full_completed)
+        task.signals.failed.connect(self._full_failed)
+        self._full_task = task
+        self._active_task = task
+        self._thread_pool.start(task)
+
+    @Slot(object)
+    def _full_progress(self, progress: TranslationProgress) -> None:
+        if not self._full_running:
+            return
+        self.full_translation_page.update_progress(
+            FullTranslationPageViewModel.from_progress(
+                progress,
+                total_count=len(self._full_selected_ids),
+                translated_before_run=self._full_translated_before_run,
+                current_category=self._full_current_category,
+                elapsed_seconds=(
+                    self._full_elapsed_previous
+                    + perf_counter()
+                    - self._full_started_at
+                ),
+            )
+        )
+
+    @Slot(object)
+    def _full_translation_event(self, event: object) -> None:
+        if not self._full_running or not isinstance(
+            event,
+            TranslationStarted,
+        ):
+            return
+        category_id = SOURCE_TYPE_TO_CATEGORY.get(
+            event.source_type,
+            ScanCategoryId.OTHER_SUPPORTED,
+        )
+        self._full_current_category = CATEGORY_DEFINITIONS[
+            category_id
+        ].title
+        self.full_translation_page.show_current_category(
+            self._full_current_category
+        )
+
+    @Slot(object)
+    def _full_completed(
+        self,
+        result: FullTranslationTaskResult,
+    ) -> None:
+        self._full_running = False
+        self._active_task = None
+        self._full_task = None
+        self._full_elapsed_previous += result.elapsed_seconds
+        self._full_result = result
+        self._full_pending_ids = result.remaining_ids
+        view_model = FullTranslationPageViewModel.from_result(
+            result,
+            current_category=self._full_current_category,
+            elapsed_seconds=self._full_elapsed_previous,
+        )
+        self.full_translation_page.show_result(view_model)
+        self.footer_status.setText("完整翻译任务结束")
+        if view_model.is_complete:
+            self.stage = WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER
+            self.pages.setCurrentWidget(self.translation_check_page)
+            self.footer_status.setText("准备检查译文")
+        self._close_if_pending()
+
+    @Slot(object)
+    def _full_failed(self, failure: TaskFailure) -> None:
+        self._full_running = False
+        self._active_task = None
+        self._full_task = None
+        self.full_translation_page.show_failure(failure.message)
+        self.footer_status.setText("完整翻译未能继续")
+        self._close_if_pending()
+
+    @Slot()
+    def pause_full_translation(self) -> None:
+        if self._full_task is None or not self._full_running:
+            return
+        self._full_task.pause()
+        self.full_translation_page.show_pause_requested()
+        self.footer_status.setText("将在当前批次完成后暂停")
+
+    @Slot()
+    def resume_full_translation(self) -> None:
+        if self._full_task is None or not self._full_running:
+            return
+        self._full_task.resume()
+        self.full_translation_page.show_resumed()
+        self.footer_status.setText("继续完整翻译")
+
+    @Slot()
+    def show_full_translation_result(self) -> None:
+        self._show_full_translation_page()
+
+    def _show_full_translation_page(self) -> None:
+        self.stage = WorkflowStage.FULL_TRANSLATION
+        self.pages.setCurrentWidget(self.full_translation_page)
+        self.home_nav_button.setChecked(False)
+        self.footer_status.setText("等待完整翻译")
 
     def _choose_directory(self) -> str | None:
         selected = QFileDialog.getExistingDirectory(
@@ -633,6 +905,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._task_running():
+            if self._full_task is not None:
+                self._full_task.request_stop()
             event.ignore()
             if not self._close_when_idle:
                 self._close_when_idle = True
@@ -661,6 +935,11 @@ class MainWindow(QMainWindow):
         self.trial_translation_page.start_button.setEnabled(False)
         self.trial_translation_page.retry_button.setEnabled(False)
         self.trial_translation_page.continue_button.setEnabled(False)
+        self.full_translation_page.back_button.setEnabled(False)
+        self.full_translation_page.start_button.setEnabled(False)
+        self.full_translation_page.pause_button.setEnabled(False)
+        self.full_translation_page.resume_button.setEnabled(False)
+        self.full_translation_page.retry_button.setEnabled(False)
 
     def _close_if_pending(self) -> None:
         if not self._close_when_idle or self._close_scheduled:
@@ -677,12 +956,26 @@ class MainWindow(QMainWindow):
             self._inspection_running
             or self._scan_running
             or self._trial_running
+            or self._full_running
         )
 
     def _pending_close_message(self) -> str:
         if self._trial_running:
             return "正在安全结束当前试译，完成后将自动关闭"
+        if self._full_running:
+            return "正在保存当前翻译批次，完成后将自动关闭"
         return "正在安全结束当前扫描，完成后将自动关闭"
+
+    def _clear_full_translation_state(self) -> None:
+        self._full_task = None
+        self._full_selected_ids = frozenset()
+        self._full_pending_ids = frozenset()
+        self._full_result = None
+        self._full_task_id = ""
+        self._full_current_category = ""
+        self._full_translated_before_run = 0
+        self._full_elapsed_previous = 0.0
+        self._full_started_at = 0.0
 
 
 def run_qt_app(
