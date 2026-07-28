@@ -9,10 +9,19 @@ from time import perf_counter
 
 from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
+from mc_han.builder.installer import InstallResult, RollbackResult
 from mc_han.core.project import project_paths
 from mc_han.qt.translation_config_view_models import TranslationSessionConfig
 from mc_han.qt.translation_config_view_models import create_translator
 from mc_han.services.scan_service import ScanServiceError
+from mc_han.services.build_install import (
+    BuildWorkflowResult,
+    ExportWorkflowResult,
+    build_localization_package,
+    export_localization_zip,
+    install_localization_package,
+    rollback_localization_install,
+)
 from mc_han.services.trial_translation import TrialTranslationError
 from mc_han.translator.engine import TranslationProgress, translate_csv
 from mc_han.usage.ledger import UsageLedger
@@ -348,3 +357,181 @@ class FullTranslationTask(QRunnable):
                 "translation progress callback received an invalid event"
             )
         self.signals.progress.emit(progress)
+
+
+class BuildInstallTaskSignals(QObject):
+    completed = Signal(object)
+    failed = Signal(object)
+
+
+class BuildTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        modpack_dir: Path,
+        csv_path: Path,
+        output_dir: Path,
+        minecraft_version: str,
+        service: Callable[..., BuildWorkflowResult] = (
+            build_localization_package
+        ),
+    ) -> None:
+        super().__init__()
+        self._modpack_dir = Path(modpack_dir)
+        self._csv_path = Path(csv_path)
+        self._output_dir = Path(output_dir)
+        self._minecraft_version = minecraft_version
+        self._service = service
+        self.signals = BuildInstallTaskSignals()
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service(
+                modpack_dir=self._modpack_dir,
+                csv_path=self._csv_path,
+                output_dir=self._output_dir,
+                minecraft_version=self._minecraft_version,
+            )
+            if not isinstance(result, BuildWorkflowResult):
+                raise TypeError("build service returned an invalid result")
+        except Exception as error:
+            self.signals.failed.emit(
+                TaskFailure(
+                    code="build_failed",
+                    message=(
+                        "资源包生成失败。已有成功输出没有被主动删除，"
+                        "请检查译文和源文件后重试。"
+                    ),
+                    detail=type(error).__name__,
+                    retryable=True,
+                    partial_saved=True,
+                )
+            )
+            return
+        self.signals.completed.emit(result)
+
+
+class ExportTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        output_dir: Path,
+        service: Callable[..., ExportWorkflowResult] = (
+            export_localization_zip
+        ),
+    ) -> None:
+        super().__init__()
+        self._output_dir = Path(output_dir)
+        self._service = service
+        self.signals = BuildInstallTaskSignals()
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service(output_dir=self._output_dir)
+            if not isinstance(result, ExportWorkflowResult):
+                raise TypeError("export service returned an invalid result")
+        except Exception as error:
+            self.signals.failed.emit(
+                TaskFailure(
+                    code="export_failed",
+                    message=(
+                        "ZIP 导出失败，已有构建目录仍然保留，"
+                        "请确认输出目录可写后重试。"
+                    ),
+                    detail=type(error).__name__,
+                    retryable=True,
+                    partial_saved=True,
+                )
+            )
+            return
+        self.signals.completed.emit(result)
+
+
+class InstallTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        modpack_dir: Path,
+        output_dir: Path,
+        service: Callable[..., InstallResult] = (
+            install_localization_package
+        ),
+    ) -> None:
+        super().__init__()
+        self._modpack_dir = Path(modpack_dir)
+        self._output_dir = Path(output_dir)
+        self._service = service
+        self.signals = BuildInstallTaskSignals()
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service(
+                modpack_dir=self._modpack_dir,
+                output_dir=self._output_dir,
+            )
+            if not isinstance(result, InstallResult):
+                raise TypeError("install service returned an invalid result")
+        except Exception as error:
+            self.signals.failed.emit(
+                TaskFailure(
+                    code="install_failed",
+                    message=(
+                        "安装未能完成。请保留输出目录和备份目录，"
+                        "检查错误后重试。"
+                    ),
+                    detail=type(error).__name__,
+                    retryable=True,
+                    partial_saved=True,
+                )
+            )
+            return
+        self.signals.completed.emit(result)
+
+
+class RollbackTask(QRunnable):
+    def __init__(
+        self,
+        *,
+        modpack_dir: Path,
+        backup_dir: Path,
+        service: Callable[..., RollbackResult] = (
+            rollback_localization_install
+        ),
+    ) -> None:
+        super().__init__()
+        self._modpack_dir = Path(modpack_dir)
+        self._backup_dir = Path(backup_dir)
+        self._service = service
+        self.signals = BuildInstallTaskSignals()
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service(
+                modpack_dir=self._modpack_dir,
+                backup_dir=self._backup_dir,
+            )
+            if not isinstance(result, RollbackResult):
+                raise TypeError("rollback service returned an invalid result")
+        except Exception as error:
+            self.signals.failed.emit(
+                TaskFailure(
+                    code="rollback_failed",
+                    message=(
+                        "撤销安装失败。备份和安装清单仍然保留，"
+                        "请不要手动删除它们。"
+                    ),
+                    detail=type(error).__name__,
+                    retryable=True,
+                    partial_saved=True,
+                )
+            )
+            return
+        self.signals.completed.emit(result)
