@@ -14,5 +14,11 @@ release/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+.mc-han/usage.sqlite3
+.mc-han/usage.sqlite3-shm
+.mc-han/usage.sqlite3-wal
+**/.mc-han/usage.sqlite3
+**/.mc-han/usage.sqlite3-shm
+**/.mc-han/usage.sqlite3-wal
 translation_cache.jsonl
 release/_pyinstaller/

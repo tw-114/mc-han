@@ -8,6 +8,7 @@ mc-han 是一个 Minecraft 整合包自动汉化工具。目标是让普通玩�
 - `mc-han preview <csv>`
 - `mc-han review <csv>`
 - `mc-han translate <modpack_dir>`
+- `mc-han usage <modpack_dir>`
 - `mc-han check <csv_or_output_dir>`
 - `mc-han build <modpack_dir>`
 - `mc-han install <modpack_dir>`
@@ -297,6 +298,21 @@ mc-han translate "D:\Minecraft\MyModpack" --provider deepseek --model "deepseek-
 ```
 
 通常不需要手动设置这些高级参数；工具会按估算 token 自动合并短文本、拆出长文本，并保留安全余量。`--batch-size` 仍可用，但现在只是 `--max-batch-items` 的旧别名。
+
+### API 用量报告
+
+真实翻译请求会把不含原文、译文、提示词和 API Key 的请求统计写入
+`<modpack_dir>\.mc-han\usage.sqlite3`。每次网络尝试（包括重试和失败）都会单独保存；
+本地缓存复用只计入节省条目，不会伪装成 API 请求。
+
+```powershell
+mc-han usage "D:\Minecraft\MyModpack"
+mc-han usage "D:\Minecraft\MyModpack" --json
+```
+
+Token 以服务商响应为准；服务商没有返回的字段显示为“未返回”，不会按字符数伪造。
+费用估算与服务商报告费用分开显示。没有明确价格配置时仍会统计 Token，但不会显示
+`0` 元或把估算值说成实际扣费。
 
 ### 物品/方块/实体名称翻译
 
