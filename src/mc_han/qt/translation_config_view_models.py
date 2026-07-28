@@ -144,19 +144,8 @@ def validate_translation_config(
             field_errors=tuple(errors),
         )
 
-    provider_name = (
-        config.provider.value
-        if config.provider is not TranslationProvider.OPENAI_COMPATIBLE
-        else f"custom:{config.base_url.rstrip('/')}"
-    )
     try:
-        translator_factory(
-            provider_name=provider_name,
-            model=config.model,
-            api_key=config.api_key,
-            base_url=config.base_url,
-            timeout_seconds=config.timeout_seconds,
-        )
+        create_translator(config, translator_factory=translator_factory)
     except (TypeError, ValueError):
         return TranslationConfigValidation(
             valid=False,
@@ -165,6 +154,25 @@ def validate_translation_config(
     return TranslationConfigValidation(
         valid=True,
         message="配置有效。当前验证不会发送网络请求，也不会产生费用。",
+    )
+
+
+def create_translator(
+    config: TranslationSessionConfig,
+    *,
+    translator_factory: TranslatorFactory = OpenAICompatibleTranslator,
+) -> OpenAICompatibleTranslator:
+    provider_name = (
+        config.provider.value
+        if config.provider is not TranslationProvider.OPENAI_COMPATIBLE
+        else f"custom:{config.base_url.rstrip('/')}"
+    )
+    return translator_factory(
+        provider_name=provider_name,
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+        timeout_seconds=config.timeout_seconds,
     )
 
 
