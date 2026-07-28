@@ -22,7 +22,8 @@ class WorkflowStage(str, Enum):
     SCAN_RESULT = "scan_result"
     TRANSLATION_CONFIG = "translation_config"
     TRIAL_TRANSLATION = "trial_translation"
-    FULL_TRANSLATION_PLACEHOLDER = "full_translation_placeholder"
+    FULL_TRANSLATION = "full_translation"
+    TRANSLATION_CHECK_PLACEHOLDER = "translation_check_placeholder"
 
 
 class StatusTone(str, Enum):
