@@ -199,8 +199,8 @@ class TrialTranslationPage(QScrollArea):
         self.failure_label.setText(message)
         self.failure_label.show()
         self.back_button.setEnabled(True)
-        self.start_button.setEnabled(False)
-        self.start_button.hide()
+        self.start_button.setEnabled(not can_retry)
+        self.start_button.setVisible(not can_retry)
         self.retry_button.setEnabled(can_retry)
         self.continue_button.setEnabled(False)
 

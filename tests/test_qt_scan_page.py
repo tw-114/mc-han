@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QScrollArea
 
 from mc_han.models import ExtractedText
 from mc_han.qt.main_window import MainWindow
+from mc_han.qt.project_session import CloseDecision
 from mc_han.qt.pages.scan_page import ScanPage
 from mc_han.qt.task_runner import ScanTask
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
@@ -314,7 +315,12 @@ def test_close_during_scan_returns_immediately_and_closes_when_worker_finishes(
         release.wait(2)
         return make_scan_result()
 
-    window = MainWindow(scan_service=slow_scan)
+    window = MainWindow(
+        scan_service=slow_scan,
+        close_decision_provider=lambda _label, _cancellable: (
+            CloseDecision.WAIT_IN_BACKGROUND
+        ),
+    )
     attach_inspection(window, make_inspection(tmp_path))
     window.show()
     window.start_scan()
@@ -361,7 +367,12 @@ def test_close_pending_finishes_after_scan_failure(
             detail="OSError",
         )
 
-    window = MainWindow(scan_service=failing_scan)
+    window = MainWindow(
+        scan_service=failing_scan,
+        close_decision_provider=lambda _label, _cancellable: (
+            CloseDecision.WAIT_IN_BACKGROUND
+        ),
+    )
     attach_inspection(window, make_inspection(tmp_path))
     window.show()
     window.start_scan()
@@ -375,6 +386,43 @@ def test_close_pending_finishes_after_scan_failure(
         lambda: not window.isVisible()
         and window._thread_pool.activeThreadCount() == 0,
     )
+
+
+def test_abandon_close_keeps_running_task_and_window_open(
+    application: QApplication,
+    tmp_path: Path,
+):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_scan(*args, **kwargs):
+        started.set()
+        release.wait(2)
+        return make_scan_result()
+
+    window = MainWindow(
+        scan_service=slow_scan,
+        close_decision_provider=lambda _label, _cancellable: (
+            CloseDecision.ABANDON_CLOSE
+        ),
+    )
+    attach_inspection(window, make_inspection(tmp_path))
+    window.show()
+    window.start_scan()
+    process_until(application, started.is_set)
+
+    window.close()
+    application.processEvents()
+
+    assert window.isVisible()
+    assert not window._close_when_idle
+    assert window.session.active_task is not None
+
+    release.set()
+    process_until(application, lambda: not window._scan_running)
+    window.close()
+    application.processEvents()
+    assert not window.isVisible()
 
 
 def test_close_without_active_task_is_immediate(

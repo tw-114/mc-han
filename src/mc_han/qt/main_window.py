@@ -43,6 +43,12 @@ from mc_han.qt.pages.settings_page import SettingsPage
 from mc_han.qt.pages.translation_config_page import TranslationConfigPage
 from mc_han.qt.pages.trial_translation_page import TrialTranslationPage
 from mc_han.qt.pages.translation_review_page import TranslationReviewPage
+from mc_han.qt.project_session import (
+    CloseDecision,
+    ProjectSession,
+    TaskKind,
+    WorkflowController,
+)
 from mc_han.qt.scan_view_models import ScanPageViewModel, ScanProgressViewModel
 from mc_han.qt.task_runner import (
     BuildTask,
@@ -125,6 +131,7 @@ ExportService = Callable[..., ExportWorkflowResult]
 InstallService = Callable[..., InstallResult]
 RollbackService = Callable[..., RollbackResult]
 DirectoryOpener = Callable[[Path], bool]
+CloseDecisionProvider = Callable[[str, bool], CloseDecision]
 
 WORKFLOW_STEP_LABELS = (
     "选择项目",
@@ -168,6 +175,7 @@ class MainWindow(QMainWindow):
         rollback_service: RollbackService = rollback_localization_install,
         directory_opener: DirectoryOpener | None = None,
         directory_picker: DirectoryPicker | None = None,
+        close_decision_provider: CloseDecisionProvider | None = None,
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
@@ -181,19 +189,14 @@ class MainWindow(QMainWindow):
         self._rollback_service = rollback_service
         self._directory_opener = directory_opener or self._open_directory
         self._directory_picker = directory_picker or self._choose_directory
+        self._close_decision_provider = (
+            close_decision_provider or self._prompt_close_decision
+        )
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
-        self._active_task: (
-            InspectionTask
-            | ScanTask
-            | TrialTranslationTask
-            | FullTranslationTask
-            | BuildTask
-            | ExportTask
-            | InstallTask
-            | RollbackTask
-            | None
-        ) = None
+        self.workflow_controller = WorkflowController(self)
+        self.session: ProjectSession = self.workflow_controller.session
+        self.workflow_controller.changed.connect(self._session_changed)
         self._inspection_running = False
         self._scan_running = False
         self._trial_running = False
@@ -223,7 +226,7 @@ class MainWindow(QMainWindow):
         self._export_result: ExportWorkflowResult | None = None
         self._review_unlocked = False
         self._build_unlocked = False
-        self._settings_return_page: QWidget | None = None
+        self._notice_boxes: list[QMessageBox] = []
         self.stage = WorkflowStage.WELCOME
 
         self.setWindowTitle("mc-han")
@@ -259,6 +262,22 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.build_install_page)
         self.pages.addWidget(self.completion_page)
         self.pages.addWidget(self.settings_page)
+        self._page_keys = {
+            self.home_page: "home",
+            self.inspection_page: "inspection",
+            self.scan_page: "scan",
+            self.translation_config_page: "translation_config",
+            self.trial_translation_page: "trial_translation",
+            self.full_translation_page: "full_translation",
+            self.translation_review_page: "translation_review",
+            self.build_install_page: "build_install",
+            self.completion_page: "completion",
+            self.settings_page: "settings",
+        }
+        self._pages_by_key = {
+            page_key: page for page, page_key in self._page_keys.items()
+        }
+        self.pages.currentChanged.connect(self._current_page_changed)
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
@@ -377,6 +396,12 @@ class MainWindow(QMainWindow):
         brand = QLabel("mc-han")
         brand.setObjectName("BrandLabel")
         brand_row.addWidget(brand)
+        self.activity_label = QLabel("当前无活动任务")
+        self.activity_label.setObjectName("MutedLabel")
+        brand_row.addWidget(self.activity_label)
+        self.activity_progress_label = QLabel("")
+        self.activity_progress_label.setObjectName("MutedLabel")
+        brand_row.addWidget(self.activity_progress_label)
         brand_row.addStretch()
         self.project_label = QLabel("未选择项目")
         self.project_label.setObjectName("MutedLabel")
@@ -436,13 +461,48 @@ class MainWindow(QMainWindow):
 
     @property
     def stage(self) -> WorkflowStage:
-        return self._stage
+        return self.session.stage
 
     @stage.setter
     def stage(self, value: WorkflowStage) -> None:
-        self._stage = value
+        self.workflow_controller.set_stage(value)
         if hasattr(self, "workflow_step_buttons"):
             self._refresh_step_navigation()
+
+    @Slot(object)
+    def _session_changed(self, _session: ProjectSession) -> None:
+        if not hasattr(self, "project_label"):
+            return
+        self.project_label.setText(self.session.project_name)
+        task = self.session.active_task
+        if task is None:
+            self.activity_label.setText("当前无活动任务")
+            self.activity_progress_label.setText("")
+        else:
+            self.activity_label.setText(f"活动任务：{task.label}")
+            self.activity_progress_label.setText(task.progress)
+        self._refresh_step_navigation()
+        self._refresh_disabled_reasons()
+
+    @Slot(int)
+    def _current_page_changed(self, index: int) -> None:
+        page = self.pages.widget(index)
+        page_key = self._page_keys.get(page)
+        if page_key and self.session.current_page != page_key:
+            self.workflow_controller.set_page(page_key)
+
+    def _show_page(self, page: QWidget, *, force: bool = False) -> None:
+        page_key = self._page_keys[page]
+        if (
+            not force
+            and self.pages.currentWidget() is self.settings_page
+            and page is not self.settings_page
+        ):
+            self.workflow_controller.update_settings_return_page(page_key)
+            return
+        self.pages.setCurrentWidget(page)
+        if self.session.current_page != page_key:
+            self.workflow_controller.set_page(page_key)
 
     def _refresh_step_navigation(self) -> None:
         current_step = STAGE_STEP_INDEX[self.stage]
@@ -509,8 +569,12 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _navigate_to_step(self, index: int) -> None:
-        enabled, _reason = self._step_access(index)
-        if not enabled or self._task_running():
+        enabled, reason = self._step_access(index)
+        if self._task_running():
+            self._show_action_blocked(self._active_task_reason())
+            return
+        if not enabled:
+            self._show_action_blocked(reason)
             return
         if index == 1 and self.current_scan_result is None:
             self.start_scan()
@@ -530,21 +594,111 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def show_settings(self) -> None:
-        self._settings_return_page = self.pages.currentWidget()
-        self.pages.setCurrentWidget(self.settings_page)
+        self.workflow_controller.open_settings()
+        self._show_page(self.settings_page, force=True)
         self.footer_status.setText("设置")
 
     @Slot()
     def close_settings(self) -> None:
-        page = self._settings_return_page or self.home_page
-        self.pages.setCurrentWidget(page)
-        self._settings_return_page = None
+        page_key = self.workflow_controller.close_settings()
+        page = self._pages_by_key.get(page_key, self.home_page)
+        self._show_page(page, force=True)
         self._refresh_step_navigation()
-        self.footer_status.setText("准备就绪")
+        self.footer_status.setText(self._session_status_text())
+
+    def _refresh_disabled_reasons(self) -> None:
+        if not hasattr(self, "pages"):
+            return
+        active_reason = self._active_task_reason() if self._task_running() else ""
+        for button in self.findChildren(QPushButton):
+            automatic = bool(button.property("automaticDisabledReason"))
+            if button.isEnabled():
+                if automatic:
+                    button.setToolTip("")
+                    button.setProperty("automaticDisabledReason", False)
+                continue
+            if button.toolTip() and not automatic:
+                continue
+            button.setToolTip(
+                active_reason or "请先完成当前步骤所需条件"
+            )
+            button.setProperty("automaticDisabledReason", True)
+
+    def _show_action_blocked(self, reason: str) -> None:
+        message = reason or "当前操作暂不可用，请先完成必要步骤。"
+        box = QMessageBox(
+            QMessageBox.Icon.Information,
+            "暂时无法执行",
+            message,
+            QMessageBox.StandardButton.Ok,
+            self,
+        )
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._notice_boxes.append(box)
+
+        def remove_box(_result: int) -> None:
+            if box in self._notice_boxes:
+                self._notice_boxes.remove(box)
+
+        box.finished.connect(remove_box)
+        box.open()
+
+    def _active_task_reason(self) -> str:
+        task = self.session.active_task
+        if task is None:
+            return ""
+        return f"{task.label}正在运行，请等待当前任务结束。"
+
+    def _session_status_text(self) -> str:
+        task = self.session.active_task
+        if task is not None:
+            return task.label
+        status_by_stage = {
+            WorkflowStage.WELCOME: "准备就绪",
+            WorkflowStage.INSPECTING: "正在检测整合包",
+            WorkflowStage.INSPECTION_RESULT: "检测完成",
+            WorkflowStage.SCANNING: "正在扫描整合包",
+            WorkflowStage.SCAN_RESULT: "扫描与分类完成",
+            WorkflowStage.TRANSLATION_CONFIG: "配置翻译服务",
+            WorkflowStage.TRIAL_TRANSLATION: "试译",
+            WorkflowStage.FULL_TRANSLATION: "完整翻译",
+            WorkflowStage.TRANSLATION_REVIEW: "检查译文",
+            WorkflowStage.BUILD_INSTALL: "生成与安装",
+            WorkflowStage.COMPLETION: "操作完成",
+        }
+        return status_by_stage.get(self.stage, "准备就绪")
+
+    def _begin_task(
+        self,
+        task: object,
+        kind: TaskKind,
+        label: str,
+        *,
+        cancel: Callable[[], None] | None = None,
+    ) -> bool:
+        started, reason = self.workflow_controller.begin_task(
+            kind,
+            label,
+            task,
+            cancel=cancel,
+        )
+        if not started:
+            self._show_action_blocked(reason)
+        else:
+            QTimer.singleShot(0, self._refresh_disabled_reasons)
+        return started
+
+    def _finish_task(self, task: object | None = None) -> None:
+        self.workflow_controller.finish_task(task)
+        QTimer.singleShot(0, self._refresh_disabled_reasons)
 
     @Slot()
     def choose_and_inspect(self) -> None:
         if self._task_running() or self._close_when_idle:
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "软件正在安全关闭，暂时不能选择新项目。"
+            )
             return
         selected = self._directory_picker()
         if selected:
@@ -552,7 +706,22 @@ class MainWindow(QMainWindow):
 
     def start_inspection(self, path: Path) -> None:
         if self._task_running() or self._close_when_idle:
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "软件正在安全关闭，暂时不能检测新项目。"
+            )
             return
+        task = InspectionTask(path, self._inspection_service)
+        if not self._begin_task(
+            task,
+            TaskKind.INSPECTION,
+            "检测整合包",
+        ):
+            return
+        self.workflow_controller.set_project(
+            path,
+            path.name or "正在检测的项目",
+        )
         self._inspection_running = True
         self.current_scan_result = None
         self.scan_selection = None
@@ -568,20 +737,22 @@ class MainWindow(QMainWindow):
         self.stage = WorkflowStage.INSPECTING
         self.home_page.select_button.setEnabled(False)
         self.inspection_page.show_loading()
-        self.pages.setCurrentWidget(self.inspection_page)
+        self._show_page(self.inspection_page)
         self.footer_status.setText("正在检测整合包")
 
-        task = InspectionTask(path, self._inspection_service)
         task.signals.completed.connect(self._inspection_completed)
         task.signals.failed.connect(self._inspection_failed)
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
     def _inspection_completed(self, inspection: ModpackInspection) -> None:
         self._inspection_running = False
-        self._active_task = None
+        self._finish_task()
         self.current_inspection = inspection
+        self.workflow_controller.set_project(
+            inspection.input_directory,
+            inspection.display_name,
+        )
         self.stage = WorkflowStage.INSPECTION_RESULT
         self.home_page.select_button.setEnabled(True)
         self.project_label.setText(inspection.display_name or "未选择项目")
@@ -594,7 +765,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _inspection_failed(self, failure: TaskFailure) -> None:
         self._inspection_running = False
-        self._active_task = None
+        self._finish_task()
         self.stage = WorkflowStage.INSPECTION_RESULT
         self.home_page.select_button.setEnabled(True)
         self.footer_status.setText("检测未完成")
@@ -604,39 +775,52 @@ class MainWindow(QMainWindow):
     @Slot()
     def start_scan(self) -> None:
         if self._task_running() or self._close_when_idle:
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "软件正在安全关闭，暂时不能开始扫描。"
+            )
             return
         inspection = self.current_inspection
         if inspection is None or not inspection.can_continue:
+            self._show_action_blocked("请先选择并识别有效的整合包。")
+            return
+        task = ScanTask(
+            inspection.input_directory,
+            self._scan_service,
+            inspection.existing_chinese,
+        )
+        if not self._begin_task(task, TaskKind.SCAN, "扫描整合包"):
             return
         self._scan_running = True
         self.current_scan_result = None
         self.scan_selection = None
         self.stage = WorkflowStage.SCANNING
         self.scan_page.show_loading(inspection.display_name)
-        self.pages.setCurrentWidget(self.scan_page)
+        self._show_page(self.scan_page)
         self.footer_status.setText("正在扫描整合包")
 
-        task = ScanTask(
-            inspection.input_directory,
-            self._scan_service,
-            inspection.existing_chinese,
-        )
         task.signals.progress.connect(self._scan_progress)
         task.signals.completed.connect(self._scan_completed)
         task.signals.failed.connect(self._scan_failed)
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
     def _scan_progress(self, event: ScanProgressEvent) -> None:
         if not self._scan_running:
             return
+        progress_text = f"已发现 {event.discovered_records:,} 条"
+        if event.total_jars:
+            progress_text = (
+                f"JAR {event.processed_jars:,}/{event.total_jars:,} · "
+                f"{progress_text}"
+            )
+        self.workflow_controller.update_task_progress(progress_text)
         self.scan_page.update_progress(ScanProgressViewModel.from_event(event))
 
     @Slot(object)
     def _scan_completed(self, result: ScanClassificationResult) -> None:
         self._scan_running = False
-        self._active_task = None
+        self._finish_task()
         self.current_scan_result = result
         self.scan_selection = ScanSelectionState.from_result(result)
         self.stage = WorkflowStage.SCAN_RESULT
@@ -647,7 +831,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _scan_failed(self, failure: TaskFailure) -> None:
         self._scan_running = False
-        self._active_task = None
+        self._finish_task()
         self.stage = WorkflowStage.SCAN_RESULT
         self.footer_status.setText("扫描未完成")
         self.scan_page.show_failure(failure)
@@ -694,30 +878,33 @@ class MainWindow(QMainWindow):
                 self.scan_selection,
             )
         )
-        self.pages.setCurrentWidget(self.scan_page)
+        self._show_page(self.scan_page)
         self._refresh_step_navigation()
 
     @Slot()
     def show_home(self) -> None:
         if self._task_running():
+            self._show_action_blocked(self._active_task_reason())
             return
         self.stage = WorkflowStage.WELCOME
-        self.pages.setCurrentWidget(self.home_page)
+        self._show_page(self.home_page)
         self.footer_status.setText("准备就绪")
 
     @Slot()
     def show_inspection_result(self) -> None:
         if self._scan_running:
+            self._show_action_blocked(self._active_task_reason())
             return
         if self.current_inspection is None:
             self.show_home()
             return
         self.stage = WorkflowStage.INSPECTION_RESULT
-        self.pages.setCurrentWidget(self.inspection_page)
+        self._show_page(self.inspection_page)
 
     @Slot()
     def show_scan_result(self) -> None:
         if self._scan_running:
+            self._show_action_blocked(self._active_task_reason())
             return
         if self.scan_selection is None:
             self.show_inspection_result()
@@ -728,6 +915,9 @@ class MainWindow(QMainWindow):
     @Slot()
     def show_translation_config(self) -> None:
         if self.scan_selection is None or self.scan_selection.selected_record_count == 0:
+            self._show_action_blocked(
+                "请先扫描并选择至少一个需要翻译的类别。"
+            )
             return
         config = (
             self.translation_config_draft
@@ -744,7 +934,7 @@ class MainWindow(QMainWindow):
             )
         )
         self.stage = WorkflowStage.TRANSLATION_CONFIG
-        self.pages.setCurrentWidget(self.translation_config_page)
+        self._show_page(self.translation_config_page)
         self.footer_status.setText("配置翻译服务")
 
     @Slot()
@@ -816,7 +1006,7 @@ class MainWindow(QMainWindow):
                 TrialPageViewModel.ready(samples)
             )
         self.stage = WorkflowStage.TRIAL_TRANSLATION
-        self.pages.setCurrentWidget(self.trial_translation_page)
+        self._show_page(self.trial_translation_page)
         self.footer_status.setText("等待确认试译")
 
     @Slot()
@@ -826,6 +1016,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def retry_failed_trial_samples(self) -> None:
         if self.trial_result is None or not self.trial_result.failed_ids:
+            self._show_action_blocked("当前没有失败的试译条目可重试。")
             return
         self._start_trial(target_ids=self.trial_result.failed_ids)
 
@@ -835,6 +1026,10 @@ class MainWindow(QMainWindow):
         target_ids: frozenset[str] | None,
     ) -> None:
         if self._task_running() or self._close_when_idle:
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "软件正在安全关闭，暂时不能开始试译。"
+            )
             return
         if (
             self.current_inspection is None
@@ -842,13 +1037,10 @@ class MainWindow(QMainWindow):
             or not self.trial_samples
             or not self._trial_task_id
         ):
+            self._show_action_blocked(
+                "请先完成翻译配置并准备试译样本。"
+            )
             return
-        self._trial_running = True
-        self._refresh_step_navigation()
-        self.trial_translation_page.show_running(
-            retry=target_ids is not None
-        )
-        self.footer_status.setText("正在进行小批量试译")
         task = TrialTranslationTask(
             self.current_inspection.input_directory,
             self.translation_session_config,
@@ -857,21 +1049,35 @@ class MainWindow(QMainWindow):
             task_id=self._trial_task_id,
             target_ids=target_ids,
         )
+        if not self._begin_task(
+            task,
+            TaskKind.TRIAL_TRANSLATION,
+            "小批量试译",
+        ):
+            return
+        self._trial_running = True
+        self._refresh_step_navigation()
+        self.trial_translation_page.show_running(
+            retry=target_ids is not None
+        )
+        self.footer_status.setText("正在进行小批量试译")
         task.signals.progress.connect(self._trial_progress)
         task.signals.completed.connect(self._trial_completed)
         task.signals.failed.connect(self._trial_failed)
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
     def _trial_progress(self, event: TrialProgressEvent) -> None:
         if self._trial_running:
+            self.workflow_controller.update_task_progress(
+                f"{event.completed:,}/{event.total:,} · {event.message}"
+            )
             self.trial_translation_page.update_progress(event)
 
     @Slot(object)
     def _trial_completed(self, result: TrialTranslationResult) -> None:
         self._trial_running = False
-        self._active_task = None
+        self._finish_task()
         self._refresh_step_navigation()
         if self.trial_result is not None:
             result = replace(
@@ -892,7 +1098,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _trial_failed(self, failure: TaskFailure) -> None:
         self._trial_running = False
-        self._active_task = None
+        self._finish_task()
         self._refresh_step_navigation()
         can_retry = bool(
             self.trial_result is not None
@@ -966,9 +1172,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def show_trial_translation_result(self) -> None:
         if self._full_running:
+            self._show_action_blocked(self._active_task_reason())
             return
         self.stage = WorkflowStage.TRIAL_TRANSLATION
-        self.pages.setCurrentWidget(self.trial_translation_page)
+        self._show_page(self.trial_translation_page)
         self.footer_status.setText("试译完成")
 
     @Slot()
@@ -978,6 +1185,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def retry_failed_full_translation(self) -> None:
         if self._full_result is None or not self._full_result.failed_ids:
+            self._show_action_blocked("当前没有失败的完整翻译条目可重试。")
             return
         self._start_full_translation(self._full_result.failed_ids)
 
@@ -986,6 +1194,10 @@ class MainWindow(QMainWindow):
         target_ids: frozenset[str],
     ) -> None:
         if self._task_running() or self._close_when_idle:
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "软件正在安全关闭，暂时不能开始完整翻译。"
+            )
             return
         if (
             self.current_inspection is None
@@ -993,6 +1205,9 @@ class MainWindow(QMainWindow):
             or not self._full_selected_ids
             or not target_ids
         ):
+            self._show_action_blocked(
+                "请先确认试译结果，并确保仍有待翻译条目。"
+            )
             return
         paths = project_paths(self.current_inspection.input_directory)
         try:
@@ -1001,6 +1216,21 @@ class MainWindow(QMainWindow):
             self.full_translation_page.show_failure(
                 "无法读取扫描清单，请返回扫描页面重新扫描。"
             )
+            return
+        task = FullTranslationTask(
+            self.current_inspection.input_directory,
+            self.translation_session_config,
+            selected_ids=self._full_selected_ids,
+            target_ids=target_ids,
+            task_id=self._full_task_id,
+            translator_factory=self._full_translator_factory,
+        )
+        if not self._begin_task(
+            task,
+            TaskKind.FULL_TRANSLATION,
+            "完整翻译",
+            cancel=task.request_stop,
+        ):
             return
         self._full_translated_before_run = sum(
             record.id in self._full_selected_ids
@@ -1017,14 +1247,6 @@ class MainWindow(QMainWindow):
             )
         )
         self.footer_status.setText("正在进行完整翻译")
-        task = FullTranslationTask(
-            self.current_inspection.input_directory,
-            self.translation_session_config,
-            selected_ids=self._full_selected_ids,
-            target_ids=target_ids,
-            task_id=self._full_task_id,
-            translator_factory=self._full_translator_factory,
-        )
         task.signals.progress.connect(self._full_progress)
         task.signals.translation_event.connect(
             self._full_translation_event
@@ -1032,13 +1254,16 @@ class MainWindow(QMainWindow):
         task.signals.completed.connect(self._full_completed)
         task.signals.failed.connect(self._full_failed)
         self._full_task = task
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
     def _full_progress(self, progress: TranslationProgress) -> None:
         if not self._full_running:
             return
+        self.workflow_controller.update_task_progress(
+            f"{progress.completed_rows:,}/{progress.total_rows:,} · "
+            f"成功 {progress.translated_rows:,} · 失败 {progress.failed_rows:,}"
+        )
         self.full_translation_page.update_progress(
             FullTranslationPageViewModel.from_progress(
                 progress,
@@ -1077,7 +1302,7 @@ class MainWindow(QMainWindow):
         result: FullTranslationTaskResult,
     ) -> None:
         self._full_running = False
-        self._active_task = None
+        self._finish_task()
         self._full_task = None
         self._refresh_step_navigation()
         self._full_elapsed_previous += result.elapsed_seconds
@@ -1097,7 +1322,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _full_failed(self, failure: TaskFailure) -> None:
         self._full_running = False
-        self._active_task = None
+        self._finish_task()
         self._full_task = None
         self._refresh_step_navigation()
         self.full_translation_page.show_failure(failure.message)
@@ -1107,16 +1332,22 @@ class MainWindow(QMainWindow):
     @Slot()
     def pause_full_translation(self) -> None:
         if self._full_task is None or not self._full_running:
+            self._show_action_blocked("当前没有可暂停的完整翻译任务。")
             return
         self._full_task.pause()
+        self.workflow_controller.update_task_progress(
+            "将在当前批次完成后暂停"
+        )
         self.full_translation_page.show_pause_requested()
         self.footer_status.setText("将在当前批次完成后暂停")
 
     @Slot()
     def resume_full_translation(self) -> None:
         if self._full_task is None or not self._full_running:
+            self._show_action_blocked("当前没有已暂停的完整翻译任务。")
             return
         self._full_task.resume()
+        self.workflow_controller.update_task_progress("继续翻译")
         self.full_translation_page.show_resumed()
         self.footer_status.setText("继续完整翻译")
 
@@ -1128,7 +1359,7 @@ class MainWindow(QMainWindow):
     def show_translation_review(self) -> None:
         self._review_unlocked = True
         self.stage = WorkflowStage.TRANSLATION_REVIEW
-        self.pages.setCurrentWidget(self.translation_review_page)
+        self._show_page(self.translation_review_page)
         self.footer_status.setText("检查译文")
         if self.current_inspection is None:
             self.translation_review_page.show_load_failure(
@@ -1232,10 +1463,11 @@ class MainWindow(QMainWindow):
     @Slot()
     def show_build_install(self) -> None:
         if self._build_running:
+            self._show_action_blocked(self._active_task_reason())
             return
         self._build_unlocked = True
         self.stage = WorkflowStage.BUILD_INSTALL
-        self.pages.setCurrentWidget(self.build_install_page)
+        self._show_page(self.build_install_page)
         self.footer_status.setText("生成与安装")
         if self.current_inspection is None:
             self.build_install_page.show_failure(
@@ -1266,12 +1498,12 @@ class MainWindow(QMainWindow):
             or self._close_when_idle
             or self.current_inspection is None
         ):
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "请先完成译文检查并确认当前整合包。"
+            )
             return
         paths = project_paths(self.current_inspection.input_directory)
-        self._build_running = True
-        self._refresh_step_navigation()
-        self.build_install_page.show_running("正在生成资源包")
-        self.footer_status.setText("正在生成资源包")
         task = BuildTask(
             modpack_dir=self.current_inspection.input_directory,
             csv_path=paths.extracted_csv,
@@ -1279,9 +1511,14 @@ class MainWindow(QMainWindow):
             minecraft_version=self.current_inspection.minecraft_version,
             service=self._build_service,
         )
+        if not self._begin_task(task, TaskKind.BUILD, "生成资源包"):
+            return
+        self._build_running = True
+        self._refresh_step_navigation()
+        self.build_install_page.show_running("正在生成资源包")
+        self.footer_status.setText("正在生成资源包")
         task.signals.completed.connect(self._build_completed)
         task.signals.failed.connect(self._build_operation_failed)
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
@@ -1297,18 +1534,23 @@ class MainWindow(QMainWindow):
     @Slot()
     def start_export(self) -> None:
         if not self._can_use_build_result():
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "请先成功生成可安装的资源包。"
+            )
+            return
+        task = ExportTask(
+            output_dir=self._build_result.output_dir,
+            service=self._export_service,
+        )
+        if not self._begin_task(task, TaskKind.EXPORT, "导出 ZIP"):
             return
         self._build_running = True
         self._refresh_step_navigation()
         self.build_install_page.show_running("正在导出 ZIP")
         self.footer_status.setText("正在导出 ZIP")
-        task = ExportTask(
-            output_dir=self._build_result.output_dir,
-            service=self._export_service,
-        )
         task.signals.completed.connect(self._export_completed)
         task.signals.failed.connect(self._build_operation_failed)
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
@@ -1327,19 +1569,24 @@ class MainWindow(QMainWindow):
             not self._can_use_build_result()
             or self.current_inspection is None
         ):
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "请先成功生成可安装的资源包。"
+            )
             return
-        self._build_running = True
-        self._refresh_step_navigation()
-        self.build_install_page.show_running("正在安装汉化包")
-        self.footer_status.setText("正在安装汉化包")
         task = InstallTask(
             modpack_dir=self.current_inspection.input_directory,
             output_dir=self._build_result.output_dir,
             service=self._install_service,
         )
+        if not self._begin_task(task, TaskKind.INSTALL, "安装汉化包"):
+            return
+        self._build_running = True
+        self._refresh_step_navigation()
+        self.build_install_page.show_running("正在安装汉化包")
+        self.footer_status.setText("正在安装汉化包")
         task.signals.completed.connect(self._install_completed)
         task.signals.failed.connect(self._build_operation_failed)
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
@@ -1360,19 +1607,24 @@ class MainWindow(QMainWindow):
             or self.current_inspection is None
             or self._install_result is None
         ):
+            self._show_action_blocked(
+                self._active_task_reason()
+                or "当前没有可撤销的安装记录。"
+            )
             return
-        self._build_running = True
-        self._refresh_step_navigation()
-        self.completion_page.show_running("正在撤销本次安装")
-        self.footer_status.setText("正在撤销本次安装")
         task = RollbackTask(
             modpack_dir=self.current_inspection.input_directory,
             backup_dir=self._install_result.backup_dir,
             service=self._rollback_service,
         )
+        if not self._begin_task(task, TaskKind.ROLLBACK, "撤销安装"):
+            return
+        self._build_running = True
+        self._refresh_step_navigation()
+        self.completion_page.show_running("正在撤销本次安装")
+        self.footer_status.setText("正在撤销本次安装")
         task.signals.completed.connect(self._rollback_completed)
         task.signals.failed.connect(self._completion_operation_failed)
-        self._active_task = task
         self._thread_pool.start(task)
 
     @Slot(object)
@@ -1401,7 +1653,7 @@ class MainWindow(QMainWindow):
                 error=True,
             )
         self.stage = WorkflowStage.BUILD_INSTALL
-        self.pages.setCurrentWidget(self.build_install_page)
+        self._show_page(self.build_install_page)
         self.footer_status.setText("生成或安装未完成")
         self._close_if_pending()
 
@@ -1437,7 +1689,7 @@ class MainWindow(QMainWindow):
 
     def _show_completion_page(self, status: str) -> None:
         self.stage = WorkflowStage.COMPLETION
-        self.pages.setCurrentWidget(self.completion_page)
+        self._show_page(self.completion_page)
         self.footer_status.setText(status)
 
     def _can_use_build_result(self) -> bool:
@@ -1451,7 +1703,7 @@ class MainWindow(QMainWindow):
 
     def _finish_build_operation(self) -> None:
         self._build_running = False
-        self._active_task = None
+        self._finish_task()
         self._refresh_step_navigation()
 
     @staticmethod
@@ -1462,7 +1714,7 @@ class MainWindow(QMainWindow):
 
     def _show_full_translation_page(self) -> None:
         self.stage = WorkflowStage.FULL_TRANSLATION
-        self.pages.setCurrentWidget(self.full_translation_page)
+        self._show_page(self.full_translation_page)
         self.footer_status.setText("等待完整翻译")
 
     def _choose_directory(self) -> str | None:
@@ -1476,15 +1728,28 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._task_running():
-            if self._full_task is not None:
-                self._full_task.request_stop()
             event.ignore()
-            if not self._close_when_idle:
-                self._close_when_idle = True
-                self._disable_task_starters_for_pending_close()
-                self.footer_status.setText(
-                    self._pending_close_message()
-                )
+            if self._close_when_idle:
+                return
+            task = self.session.active_task
+            decision = self._close_decision_provider(
+                task.label if task is not None else "当前任务",
+                bool(task is not None and task.cancellable),
+            )
+            if decision is CloseDecision.ABANDON_CLOSE:
+                return
+            if decision is CloseDecision.CANCEL_TASK:
+                if not self.workflow_controller.cancel_active_task():
+                    self._show_action_blocked(
+                        "当前任务暂不支持立即取消，请选择继续后台等待，"
+                        "或放弃关闭后稍后再试。"
+                    )
+                    return
+            self._close_when_idle = True
+            self._disable_task_starters_for_pending_close()
+            self.footer_status.setText(
+                self._pending_close_message()
+            )
             # This keeps the event loop responsive until the read-only worker
             # returns. A future batch can add cooperative cancellation checks;
             # a thread blocked in operating-system I/O cannot be cancelled here.
@@ -1519,6 +1784,7 @@ class MainWindow(QMainWindow):
         self.completion_page.back_button.setEnabled(False)
         self.completion_page.open_button.setEnabled(False)
         self.completion_page.rollback_button.setEnabled(False)
+        self._refresh_disabled_reasons()
 
     def _close_if_pending(self) -> None:
         if not self._close_when_idle or self._close_scheduled:
@@ -1531,13 +1797,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.close)
 
     def _task_running(self) -> bool:
-        return (
-            self._inspection_running
-            or self._scan_running
-            or self._trial_running
-            or self._full_running
-            or self._build_running
-        )
+        return self.workflow_controller.task_running
 
     def _pending_close_message(self) -> str:
         if self._trial_running:
@@ -1547,6 +1807,47 @@ class MainWindow(QMainWindow):
         if self._build_running:
             return "正在完成当前文件操作，完成后将自动关闭"
         return "正在安全结束当前扫描，完成后将自动关闭"
+
+    def _prompt_close_decision(
+        self,
+        task_label: str,
+        cancellable: bool,
+    ) -> CloseDecision:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("任务仍在运行")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText(f"{task_label}仍在运行，请选择关闭方式。")
+        dialog.setInformativeText(
+            "继续后台等待会在任务结束后自动关闭；"
+            "取消任务会请求安全停止；放弃关闭会返回程序。"
+        )
+        wait_button = dialog.addButton(
+            "继续后台等待",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_button = dialog.addButton(
+            "取消任务",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        abandon_button = dialog.addButton(
+            "放弃关闭",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        cancel_button.setToolTip(
+            "请求任务在安全边界停止"
+            if cancellable
+            else "当前任务暂不支持立即取消"
+        )
+        cancel_button.setEnabled(cancellable)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is wait_button:
+            return CloseDecision.WAIT_IN_BACKGROUND
+        if clicked is cancel_button:
+            return CloseDecision.CANCEL_TASK
+        if clicked is abandon_button:
+            return CloseDecision.ABANDON_CLOSE
+        return CloseDecision.ABANDON_CLOSE
 
     def _clear_full_translation_state(self) -> None:
         self._full_task = None
