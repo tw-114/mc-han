@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 from .extractors.ftbquests import (
     discover_en_us_lang_files,
@@ -42,25 +45,80 @@ class ScanRecords(list[ExtractedText]):
         self.inventory = inventory
 
 
+@dataclass(frozen=True)
+class ScannerProgress:
+    phase: str
+    processed_jars: int
+    total_jars: int
+    current_source: str
+    discovered_records: int
+
+
+ScannerProgressCallback = Callable[[ScannerProgress], None]
+
+
 def scan_modpack(
     modpack_dir: Path,
     *,
     translate_names: bool = False,
     zip_limits: ZipSafetyLimits = DEFAULT_ZIP_LIMITS,
+    progress: ScannerProgressCallback | None = None,
 ) -> list[ExtractedText]:
     modpack_dir = Path(modpack_dir)
     records: list[ExtractedText] = []
     jar_results: list[tuple[str, JarScanResult]] = []
+    phase_timings: dict[str, float] = {}
+    jar_timings: list[tuple[str, float]] = []
+    mods_dir = modpack_dir / "mods"
+    total_jars = len(list(mods_dir.glob("*.jar"))) if mods_dir.exists() else 0
+
+    _notify_scan_progress(progress, "ftbquests", 0, total_jars, "", len(records))
+    started_at = perf_counter()
     records.extend(scan_ftbquests(modpack_dir))
-    records.extend(scan_filesystem_lang_sources(modpack_dir, translate_names=translate_names))
+    phase_timings["ftbquests"] = perf_counter() - started_at
+
+    _notify_scan_progress(progress, "filesystem", 0, total_jars, "", len(records))
+    started_at = perf_counter()
+    records.extend(
+        scan_filesystem_lang_sources(
+            modpack_dir,
+            translate_names=translate_names,
+        )
+    )
+    phase_timings["filesystem"] = perf_counter() - started_at
+
+    started_at = perf_counter()
     records.extend(
         scan_mod_jars(
             modpack_dir,
             translate_names=translate_names,
             limits=zip_limits,
             jar_results=jar_results,
+            progress=(
+                lambda processed, total, source, discovered: _notify_scan_progress(
+                    progress,
+                    "jars",
+                    processed,
+                    total,
+                    source,
+                    discovered,
+                )
+            ),
+            initial_record_count=len(records),
+            timings=jar_timings,
         )
     )
+    phase_timings["jars"] = perf_counter() - started_at
+
+    _notify_scan_progress(
+        progress,
+        "sorting",
+        total_jars,
+        total_jars,
+        "",
+        len(records),
+    )
+    started_at = perf_counter()
     sorted_records = sorted(
         records,
         key=lambda item: (
@@ -71,10 +129,37 @@ def scan_modpack(
             item.original,
         ),
     )
+    phase_timings["sorting"] = perf_counter() - started_at
+
+    started_at = perf_counter()
+    inventory = build_scan_inventory(modpack_dir, jar_results)
+    phase_timings["inventory"] = perf_counter() - started_at
+    inventory["scan_phase_seconds"] = phase_timings
+    inventory["jar_scan_seconds"] = tuple(jar_timings)
     return ScanRecords(
         sorted_records,
-        inventory=build_scan_inventory(modpack_dir, jar_results),
+        inventory=inventory,
     )
+
+
+def _notify_scan_progress(
+    callback: ScannerProgressCallback | None,
+    phase: str,
+    processed_jars: int,
+    total_jars: int,
+    current_source: str,
+    discovered_records: int,
+) -> None:
+    if callback is not None:
+        callback(
+            ScannerProgress(
+                phase=phase,
+                processed_jars=processed_jars,
+                total_jars=total_jars,
+                current_source=current_source,
+                discovered_records=discovered_records,
+            )
+        )
 
 
 def merge_existing_translations(

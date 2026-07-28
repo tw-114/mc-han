@@ -126,9 +126,14 @@ def test_scan_progress_view_model_does_not_show_unsafe_source():
             "正在扫描",
             current_source="/home/private/mod.jar",
             discovered_records=12,
+            processed_jars=7,
+            total_jars=20,
         )
     )
 
     assert view_model.stage_text == "正在扫描"
     assert view_model.source_text == ""
     assert view_model.discovered_text == "已发现 12 条内容"
+    assert view_model.jar_progress_text == "模组进度：7 / 20"
+    assert view_model.processed_jars == 7
+    assert view_model.total_jars == 20

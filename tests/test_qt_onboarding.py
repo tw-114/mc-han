@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication, QLabel
 from mc_han.qt.main_window import MainWindow
 from mc_han.qt.task_runner import InspectionTask
 from mc_han.qt.view_models import WorkflowStage
+from mc_han.scanner import ScanRecords
+from mc_han.services.scan_service import classify_scan_records
 from mc_han.version import get_version
 from mc_han.workflow.models import (
     CAPABILITY_ORDER,
@@ -73,11 +75,73 @@ def test_window_smoke_and_home_content(application: QApplication):
     assert window.size().width() >= 920
     assert "让 Minecraft 整合包汉化变得简单" in labels
     assert "尚无最近项目" in labels
+    assert "从整合包到可安装汉化包" in labels
+    assert any(
+        "7. 构建与安装" in label.text()
+        for label in window.findChildren(QLabel)
+    )
     assert f"v{get_version()}" in labels
     assert window.home_page.select_button.text() == "选择整合包"
+    assert [button.text() for button in window.workflow_step_buttons] == [
+        "1. 选择项目",
+        "2. 扫描内容",
+        "3. 配置翻译",
+        "4. 小批量试译",
+        "5. 完整翻译",
+        "6. 译文检查",
+        "7. 构建与安装",
+    ]
+    assert window.workflow_step_buttons[0].isChecked()
+    assert not window.workflow_step_buttons[1].isEnabled()
+    assert "请先选择" in window.workflow_step_buttons[1].toolTip()
 
     window.close()
     application.processEvents()
+
+
+def test_settings_is_always_available_and_returns_to_current_page(
+    application: QApplication,
+):
+    window = MainWindow()
+    original_page = window.pages.currentWidget()
+
+    assert window.settings_button.isEnabled()
+    window.settings_button.click()
+    application.processEvents()
+    assert window.pages.currentWidget() is window.settings_page
+    assert window.settings_page.back_button.isEnabled()
+
+    window.settings_page.back_button.click()
+    application.processEvents()
+    assert window.pages.currentWidget() is original_page
+    window.close()
+
+
+def test_completed_workflow_step_can_return(
+    application: QApplication,
+):
+    def fake_scan(*_args, **_kwargs):
+        return classify_scan_records(ScanRecords(), scan_duration=0.1)
+
+    window = MainWindow(scan_service=fake_scan)
+    inspection = make_result(InspectionValidity.VALID)
+    window._inspection_completed(inspection)
+
+    assert window.workflow_step_buttons[0].isChecked()
+    assert window.workflow_step_buttons[1].isEnabled()
+    window.workflow_step_buttons[1].click()
+    process_until(
+        application,
+        lambda: window.stage is WorkflowStage.SCAN_RESULT,
+    )
+    assert window.pages.currentWidget() is window.scan_page
+    assert window.workflow_step_buttons[1].isChecked()
+
+    window.workflow_step_buttons[0].click()
+    application.processEvents()
+    assert window.pages.currentWidget() is window.inspection_page
+    assert window.workflow_step_buttons[0].isChecked()
+    window.close()
 
 
 def test_directory_selection_runs_service_off_main_thread(

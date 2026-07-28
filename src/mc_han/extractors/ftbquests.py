@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from bisect import bisect_right
 from pathlib import Path
 
 from mc_han.extractors.common import (
@@ -17,14 +18,14 @@ from mc_han.utils.paths import relative_posix
 
 KEY_VALUE_RE = re.compile(r"^\s*(?P<key>[^#:=\s][^:=]*?)\s*[:=]\s*(?P<value>.*?)\s*$")
 SNBT_STRING_PAIR_RE = re.compile(
-    r'(?P<key>"(?:\\.|[^"])+?"|[A-Za-z0-9_.-]+)\s*:\s*"(?P<value>(?:\\.|[^"])*)"',
+    r'(?P<key>"(?:\\.|[^"\\])+"|[A-Za-z0-9_.-]+)\s*:\s*"(?P<value>(?:\\.|[^"\\])*)"',
 )
 FTBQUEST_TEXT_KEYS = {"title", "subtitle", "description"}
 FTBQUEST_DIRECTIVE_RE = re.compile(
     r"^\{(?:@[A-Za-z0-9_.-]+|image:|item:|entity:|recipe:|quest:|chapter:).*}$"
 )
 SNBT_DESCRIPTION_START_RE = re.compile(r"description\s*:\s*\[")
-SNBT_STRING_RE = re.compile(r'"(?P<value>(?:\\.|[^"])*)"')
+SNBT_STRING_RE = re.compile(r'"(?P<value>(?:\\.|[^"\\])*)"')
 
 
 def scan_ftbquests(modpack_dir: Path) -> list[ExtractedText]:
@@ -111,6 +112,7 @@ def extract_ftbquests_lang_file(content: str, *, file_path: str) -> list[Extract
 def extract_ftbquests_snbt(content: str, *, file_path: str) -> list[ExtractedText]:
     records: list[ExtractedText] = []
     consumed_ranges: list[tuple[int, int]] = []
+    newline_offsets = _newline_offsets(content)
 
     for array_start, array_end, body_start, body in iter_description_arrays(content):
         consumed_ranges.append((array_start, array_end))
@@ -119,7 +121,7 @@ def extract_ftbquests_snbt(content: str, *, file_path: str) -> list[ExtractedTex
             if not should_include_ftbquest_text(value):
                 continue
             absolute_start = body_start + string_match.start()
-            line_number = content.count("\n", 0, absolute_start) + 1
+            line_number = _line_number(newline_offsets, absolute_start)
             records.append(
                 make_record(
                     source_type="ftbquests_snbt",
@@ -131,8 +133,10 @@ def extract_ftbquests_snbt(content: str, *, file_path: str) -> list[ExtractedTex
                 )
             )
 
+    consumed_ranges = _merge_ranges(consumed_ranges)
+    range_starts = tuple(start for start, _end in consumed_ranges)
     for match in SNBT_STRING_PAIR_RE.finditer(content):
-        if any(start <= match.start() < end for start, end in consumed_ranges):
+        if _position_in_ranges(match.start(), consumed_ranges, range_starts):
             continue
         key = strip_wrapping_quotes(match.group("key"))
         if key not in FTBQUEST_TEXT_KEYS:
@@ -140,7 +144,7 @@ def extract_ftbquests_snbt(content: str, *, file_path: str) -> list[ExtractedTex
         value = decode_escaped_string(match.group("value"))
         if not should_include_ftbquest_text(value):
             continue
-        line_number = content.count("\n", 0, match.start()) + 1
+        line_number = _line_number(newline_offsets, match.start())
         records.append(
             make_record(
                 source_type="ftbquests_snbt",
@@ -237,6 +241,7 @@ def extract_key_value_lines(content: str, *, file_path: str) -> list[ExtractedTe
 
 def extract_snbt_pairs(content: str, *, file_path: str) -> list[ExtractedText]:
     records: list[ExtractedText] = []
+    newline_offsets = _newline_offsets(content)
     for match in SNBT_STRING_PAIR_RE.finditer(content):
         key = strip_wrapping_quotes(match.group("key"))
         value = decode_escaped_string(match.group("value"))
@@ -244,7 +249,7 @@ def extract_snbt_pairs(content: str, *, file_path: str) -> list[ExtractedText]:
             continue
         if not is_translatable_text(value):
             continue
-        line_number = content.count("\n", 0, match.start()) + 1
+        line_number = _line_number(newline_offsets, match.start())
         records.append(
             make_record(
                 source_type="ftbquests_lang",
@@ -256,3 +261,31 @@ def extract_snbt_pairs(content: str, *, file_path: str) -> list[ExtractedText]:
             )
         )
     return records
+
+
+def _newline_offsets(content: str) -> tuple[int, ...]:
+    return tuple(index for index, char in enumerate(content) if char == "\n")
+
+
+def _line_number(newline_offsets: tuple[int, ...], position: int) -> int:
+    return bisect_right(newline_offsets, position) + 1
+
+
+def _position_in_ranges(
+    position: int,
+    ranges: list[tuple[int, int]],
+    range_starts: tuple[int, ...],
+) -> bool:
+    range_index = bisect_right(range_starts, position) - 1
+    return range_index >= 0 and position < ranges[range_index][1]
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged and start <= merged[-1][1]:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged

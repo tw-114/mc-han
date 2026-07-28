@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ReleaseDirectory,
-    [switch]$CheckVisibleWindow
+    [switch]$CheckVisibleWindow,
+    [switch]$CheckEndToEnd
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +23,19 @@ if (-not $SmokeProcess.WaitForExit(20000)) {
 }
 if ($SmokeProcess.ExitCode -ne 0) {
     throw "The executable smoke test failed with exit code $($SmokeProcess.ExitCode)."
+}
+
+if ($CheckEndToEnd) {
+    $EndToEndProcess = Start-Process -FilePath $ExePath `
+        -ArgumentList "--e2e-smoke-test" `
+        -WorkingDirectory $ResolvedRelease -PassThru -WindowStyle Hidden
+    if (-not $EndToEndProcess.WaitForExit(120000)) {
+        $EndToEndProcess.Kill()
+        throw "The executable end-to-end smoke test timed out."
+    }
+    if ($EndToEndProcess.ExitCode -ne 0) {
+        throw "The executable end-to-end smoke test failed with exit code $($EndToEndProcess.ExitCode)."
+    }
 }
 
 if ($CheckVisibleWindow) {

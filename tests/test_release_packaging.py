@@ -77,6 +77,7 @@ def test_windows_build_script_uses_derived_archive_name_and_audits_output():
     assert '"licenses"' in script
     assert "Get-FileHash" in script
     assert "windows_checksum_name" in script
+    assert "CheckEndToEnd" in script
     assert re.search(r"translations\.sqlite", script)
 
 

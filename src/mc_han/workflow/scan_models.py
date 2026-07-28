@@ -244,6 +244,8 @@ class ScanProgressEvent:
     message: str
     current_source: str = ""
     discovered_records: int = 0
+    processed_jars: int = 0
+    total_jars: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.stage, ScanProgressStage):
@@ -253,10 +255,14 @@ class ScanProgressEvent:
             str,
         ):
             raise TypeError("progress text fields must be strings")
-        if type(self.discovered_records) is not int:
-            raise TypeError("discovered_records must be an integer")
-        if self.discovered_records < 0:
-            raise ValueError("discovered_records must not be negative")
+        for field_name in ("discovered_records", "processed_jars", "total_jars"):
+            value = getattr(self, field_name)
+            if type(value) is not int:
+                raise TypeError(f"{field_name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{field_name} must not be negative")
+        if self.processed_jars > self.total_jars:
+            raise ValueError("processed_jars must not exceed total_jars")
 
 
 @dataclass(frozen=True)

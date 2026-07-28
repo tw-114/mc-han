@@ -132,7 +132,11 @@ def application_stylesheet() -> str:
         border: 0;
         background: transparent;
         color: #6F7785;
-        padding: 0 12px;
+        padding: 0 8px;
+        min-height: 34px;
+    }
+    QPushButton[nav="true"][completed="true"] {
+        color: #2EAD65;
     }
     QPushButton[nav="true"]:checked {
         color: #2F80ED;

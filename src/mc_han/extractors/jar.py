@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import zipfile
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from time import perf_counter
 
 from mc_han.extractors.guideme import extract_markdown
 from mc_han.extractors.lang_json import extract_flat_lang_json
@@ -32,6 +34,9 @@ class JarScanResult:
     diagnostics: list[ZipDiagnostic]
 
 
+JarProgressCallback = Callable[[int, int, str, int], None]
+
+
 def scan_mod_jars(
     modpack_dir: Path,
     *,
@@ -39,25 +44,49 @@ def scan_mod_jars(
     limits: ZipSafetyLimits = DEFAULT_ZIP_LIMITS,
     diagnostics: list[tuple[str, ZipDiagnostic]] | None = None,
     jar_results: list[tuple[str, JarScanResult]] | None = None,
+    progress: JarProgressCallback | None = None,
+    initial_record_count: int = 0,
+    timings: list[tuple[str, float]] | None = None,
 ) -> list[ExtractedText]:
     mods_dir = modpack_dir / "mods"
     if not mods_dir.exists():
         return []
 
     records: list[ExtractedText] = []
-    for jar_path in sorted(mods_dir.glob("*.jar")):
+    jar_paths = sorted(mods_dir.glob("*.jar"))
+    total_jars = len(jar_paths)
+    if progress is not None:
+        progress(0, total_jars, "", initial_record_count)
+    for index, jar_path in enumerate(jar_paths):
         container = relative_posix(jar_path, modpack_dir)
+        if progress is not None:
+            progress(
+                index,
+                total_jars,
+                container,
+                initial_record_count + len(records),
+            )
+        started_at = perf_counter()
         result = inspect_and_scan_jar(
             jar_path,
             container=container,
             translate_names=translate_names,
             limits=limits,
         )
+        if timings is not None:
+            timings.append((container, perf_counter() - started_at))
         records.extend(result.records)
         if diagnostics is not None:
             diagnostics.extend((container, item) for item in result.diagnostics)
         if jar_results is not None:
             jar_results.append((container, result))
+        if progress is not None:
+            progress(
+                index + 1,
+                total_jars,
+                container,
+                initial_record_count + len(records),
+            )
     return records
 
 

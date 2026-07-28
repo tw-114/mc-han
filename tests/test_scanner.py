@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections import Counter
 import csv
 import json
+from time import perf_counter
 import zipfile
 
 import mc_han.scanner as scanner_module
 from mc_han.cli import build_parser, main
+from mc_han.extractors.ftbquests import extract_ftbquests_snbt
 from mc_han.extractors.jar import JarScanResult, scan_jar, scan_mod_jars
 from mc_han.scanner import build_scan_report, scan_modpack, write_extracted_csv
 from mc_han.utils.safe_zip import (
@@ -185,6 +187,62 @@ def test_scan_modpack_extracts_supported_sources(tmp_path):
     assert all("This is code" not in original for original in originals)
     assert any("$(item)Quartz$(0)" in original for original in originals)
     assert any("golden bowl" in original for original in originals)
+
+
+def test_ftbquests_parser_handles_escape_heavy_snbt_without_backtracking():
+    content = (
+        '"' + "\\" * 32 + '" is not a key-value pair\n'
+        'title: "A valid title"\n'
+        'description: ["First line", "Second line"]'
+    )
+
+    started_at = perf_counter()
+    records = extract_ftbquests_snbt(content, file_path="quests/chapter.snbt")
+
+    assert perf_counter() - started_at < 1.0
+    assert [record.original for record in records] == [
+        "First line",
+        "Second line",
+        "A valid title",
+    ]
+
+
+def test_scan_modpack_reports_real_jar_progress_and_phase_timings(tmp_path):
+    modpack = tmp_path / "pack"
+    mods = modpack / "mods"
+    mods.mkdir(parents=True)
+    for name in ("a.jar", "b.jar"):
+        with zipfile.ZipFile(mods / name, "w") as jar:
+            jar.writestr(
+                f"assets/{name[0]}/lang/en_us.json",
+                json.dumps({"message.demo": f"Text from {name}"}),
+            )
+    events = []
+
+    records = scan_modpack(modpack, progress=events.append)
+
+    jar_events = [event for event in events if event.phase == "jars"]
+    assert len(records) == 2
+    assert jar_events[0].processed_jars == 0
+    assert jar_events[0].total_jars == 2
+    assert jar_events[-1].processed_jars == 2
+    assert jar_events[-1].total_jars == 2
+    assert jar_events[-1].discovered_records == 2
+    assert {event.current_source for event in jar_events if event.current_source} == {
+        "mods/a.jar",
+        "mods/b.jar",
+    }
+    assert set(records.inventory["scan_phase_seconds"]) == {
+        "ftbquests",
+        "filesystem",
+        "jars",
+        "sorting",
+        "inventory",
+    }
+    assert tuple(name for name, _seconds in records.inventory["jar_scan_seconds"]) == (
+        "mods/a.jar",
+        "mods/b.jar",
+    )
 
 
 def test_write_extracted_csv_has_required_fields(tmp_path):
