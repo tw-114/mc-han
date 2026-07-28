@@ -107,6 +107,103 @@ def test_inspect_without_metadata_but_with_mods_and_config_is_probable(tmp_path:
     assert any(message.code == "incomplete_instance_evidence" for message in result.messages)
 
 
+def test_large_readable_instance_layout_is_valid_without_version_metadata(
+    tmp_path: Path,
+):
+    pack = tmp_path / "launcher-instance"
+    for index in range(10):
+        write_jar(pack / "mods" / f"mod-{index}.jar")
+    (pack / "config").mkdir()
+    (pack / "resourcepacks").mkdir()
+
+    result = inspect_modpack(pack)
+
+    assert result.validity is InspectionValidity.VALID
+    assert result.minecraft_version == "unknown"
+    assert result.loader_name == "unknown"
+    assert not any(
+        message.code == "incomplete_instance_evidence"
+        for message in result.messages
+    )
+    assert any(
+        message.code == "minecraft_version_unknown"
+        for message in result.messages
+    )
+    assert any(message.code == "loader_unknown" for message in result.messages)
+
+
+def test_unreadable_archives_do_not_make_large_layout_valid(tmp_path: Path):
+    pack = tmp_path / "invalid-jars"
+    mods = pack / "mods"
+    mods.mkdir(parents=True)
+    for index in range(10):
+        (mods / f"mod-{index}.jar").write_bytes(b"not a zip")
+    (pack / "config").mkdir()
+
+    result = inspect_modpack(pack)
+
+    assert result.validity is InspectionValidity.PROBABLE
+
+
+def test_inspect_pcl_metadata_and_launcher_version_json(tmp_path: Path):
+    pack = tmp_path / "PCL Instance"
+    (pack / "PCL").mkdir(parents=True)
+    (pack / "PCL" / "Setup.ini").write_text(
+        "VersionVanillaName:1.21.1\nVersionNeoForge:21.1.234\n",
+        encoding="utf-8",
+    )
+    write_json(
+        pack / "PCL Instance.json",
+        {
+            "id": "PCL Instance",
+            "clientVersion": "1.21.1",
+            "libraries": [
+                {
+                    "name": "net.neoforged.fancymodloader:loader:4.0.42"
+                }
+            ],
+        },
+    )
+
+    result = inspect_modpack(pack)
+
+    assert result.validity is InspectionValidity.VALID
+    assert result.minecraft_version == "1.21.1"
+    assert result.loader == LoaderInfo("NeoForge", "21.1.234")
+    assert "parsed metadata: PCL/Setup.ini" in result.evidence
+    assert "parsed metadata: PCL Instance.json" in result.evidence
+
+
+@pytest.mark.parametrize(
+    ("coordinate", "loader"),
+    (
+        ("net.fabricmc:fabric-loader:0.16.14", LoaderInfo("Fabric", "0.16.14")),
+        ("org.quiltmc:quilt-loader:0.27.1", LoaderInfo("Quilt", "0.27.1")),
+        ("net.minecraftforge:forge:1.20.1-47.3.0", LoaderInfo("Forge", "1.20.1-47.3.0")),
+    ),
+)
+def test_inspect_common_launcher_version_manifest(
+    tmp_path: Path,
+    coordinate: str,
+    loader: LoaderInfo,
+):
+    pack = tmp_path / f"{loader.name} Instance"
+    write_json(
+        pack / f"{pack.name}.json",
+        {
+            "id": pack.name,
+            "clientVersion": "1.20.1",
+            "libraries": [{"name": coordinate}],
+        },
+    )
+
+    result = inspect_modpack(pack)
+
+    assert result.validity is InspectionValidity.VALID
+    assert result.minecraft_version == "1.20.1"
+    assert result.loader == loader
+
+
 def test_inspect_empty_directory_is_invalid(tmp_path: Path):
     pack = tmp_path / "empty"
     pack.mkdir()

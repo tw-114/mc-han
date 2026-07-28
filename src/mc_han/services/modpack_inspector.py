@@ -57,9 +57,11 @@ METADATA_FILES = (
     "modrinth.index.json",
     "profile.json",
     "pack.toml",
+    "PCL/Setup.ini",
 )
 
 INSTANCE_MARKERS = ("mods", "config", "resourcepacks", "kubejs")
+MIN_VALID_JARS_FOR_INSTANCE = 10
 
 
 @dataclass(frozen=True)
@@ -193,12 +195,15 @@ def inspect_modpack(
 
     jar_diagnostic_count = 0
     jar_diagnostic_messages = 0
+    valid_jar_count = 0
     for jar_path in jar_paths:
         result = _inspect_jar_capabilities(
             input_path,
             jar_path,
             zip_limits=zip_limits,
         )
+        if result.readable:
+            valid_jar_count += 1
         for key, count in result.capability_counts.items():
             aggregate = capability_results[key]
             aggregate.detected = True
@@ -248,6 +253,7 @@ def inspect_modpack(
         facts=facts,
         markers=markers,
         mod_count=mod_count,
+        valid_jar_count=valid_jar_count,
         wrong_level=wrong_level,
     )
 
@@ -334,6 +340,7 @@ class _JarCapabilityResult:
     chinese_count: int
     diagnostics: tuple[ZipDiagnostic, ...]
     unsafe_entry_seen: bool
+    readable: bool
 
 
 def _inspect_jar_capabilities(
@@ -347,6 +354,7 @@ def _inspect_jar_capabilities(
     chinese_count = 0
     diagnostics: list[ZipDiagnostic] = []
     unsafe_entry_seen = False
+    readable = False
     try:
         safe_jar = resolve_path_for_operation(
             root,
@@ -355,6 +363,7 @@ def _inspect_jar_capabilities(
             allowed_top_levels={"mods"},
         )
         with zipfile.ZipFile(safe_jar) as archive:
+            readable = True
             reader: SafeZipReader[tuple[str, ...]] = SafeZipReader(archive, limits=zip_limits)
 
             def select_entry(name: str) -> tuple[str, ...] | None:
@@ -397,6 +406,7 @@ def _inspect_jar_capabilities(
         chinese_count=chinese_count,
         diagnostics=tuple(diagnostics),
         unsafe_entry_seen=unsafe_entry_seen,
+        readable=readable,
     )
 
 
@@ -518,7 +528,8 @@ def _inspect_metadata(
     evidence: list[str],
 ) -> _MetadataFacts:
     facts = _MetadataFacts()
-    for filename in METADATA_FILES:
+    filenames = (*METADATA_FILES, f"{root.name}.json")
+    for filename in dict.fromkeys(filenames):
         candidate = _safe_known_path(root, filename, messages)
         if candidate is None:
             continue
@@ -535,6 +546,8 @@ def _inspect_metadata(
                 _parse_instance_cfg(text, filename, facts)
             elif filename == "pack.toml":
                 _parse_pack_toml(text, filename, facts)
+            elif filename == "PCL/Setup.ini":
+                _parse_pcl_setup(text, filename, facts)
             else:
                 raw = json.loads(text)
                 if not isinstance(raw, dict):
@@ -670,7 +683,53 @@ def _parse_json_metadata(filename: str, raw: dict[str, Any], facts: _MetadataFac
         )
         return
 
-    raise ValueError("unsupported metadata file")
+    _parse_launcher_version_json(filename, raw, facts)
+
+
+def _parse_launcher_version_json(
+    filename: str,
+    raw: dict[str, Any],
+    facts: _MetadataFacts,
+) -> None:
+    game_version = raw.get("clientVersion") or raw.get("inheritsFrom")
+    libraries = raw.get("libraries")
+    loader_evidence: list[tuple[str, object]] = []
+    if isinstance(libraries, list):
+        for library in libraries:
+            if not isinstance(library, dict):
+                continue
+            coordinate = library.get("name")
+            if not isinstance(coordinate, str):
+                continue
+            parts = coordinate.split(":")
+            if len(parts) < 2:
+                continue
+            group, artifact = parts[0].lower(), parts[1].lower()
+            version = parts[2] if len(parts) >= 3 else None
+            if group == "net.fabricmc" and artifact == "fabric-loader":
+                loader_evidence.append(("fabric", version))
+            elif group == "org.quiltmc" and artifact == "quilt-loader":
+                loader_evidence.append(("quilt", version))
+            elif group == "net.neoforged" and artifact in {
+                "neoforge",
+                "fancymodloader",
+            }:
+                loader_evidence.append(
+                    ("neoforge", version if artifact == "neoforge" else None)
+                )
+            elif group == "net.minecraftforge" and artifact == "forge":
+                loader_evidence.append(("forge", version))
+    if game_version is None and not loader_evidence:
+        raise ValueError("not a recognized launcher version manifest")
+    _add_name(facts, raw.get("id"), filename, priority=50)
+    _add_minecraft_version(facts, game_version, filename)
+    for loader_name, loader_version in loader_evidence:
+        _add_loader_identifier(
+            facts,
+            loader_name,
+            filename,
+            explicit_version=loader_version,
+        )
 
 
 def _parse_instance_cfg(text: str, filename: str, facts: _MetadataFacts) -> None:
@@ -688,6 +747,30 @@ def _parse_instance_cfg(text: str, filename: str, facts: _MetadataFacts) -> None
         ("neoforgeversion", "neoforge"),
         ("fabricloaderversion", "fabric"),
         ("quiltloaderversion", "quilt"),
+    ):
+        if values.get(key):
+            _add_loader_identifier(
+                facts,
+                loader_name,
+                filename,
+                explicit_version=values.get(key),
+            )
+
+
+def _parse_pcl_setup(text: str, filename: str, facts: _MetadataFacts) -> None:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read_string("[instance]\n" + text)
+    values = parser["instance"]
+    _add_minecraft_version(
+        facts,
+        values.get("versionvanillaname"),
+        filename,
+    )
+    for key, loader_name in (
+        ("versionneoforge", "neoforge"),
+        ("versionforge", "forge"),
+        ("versionfabric", "fabric"),
+        ("versionquilt", "quilt"),
     ):
         if values.get(key):
             _add_loader_identifier(
@@ -880,6 +963,7 @@ def _resolve_validity(
     facts: _MetadataFacts,
     markers: set[str],
     mod_count: int,
+    valid_jar_count: int,
     wrong_level: bool,
 ) -> InspectionValidity:
     has_strong_metadata = bool(
@@ -887,6 +971,15 @@ def _resolve_validity(
         and (facts.minecraft_versions or facts.loaders)
     )
     if has_strong_metadata:
+        return InspectionValidity.VALID
+    has_established_instance_layout = (
+        not wrong_level
+        and "mods" in markers
+        and bool(markers.intersection({"config", "resourcepacks", "kubejs"}))
+        and mod_count >= MIN_VALID_JARS_FOR_INSTANCE
+        and valid_jar_count >= MIN_VALID_JARS_FOR_INSTANCE
+    )
+    if has_established_instance_layout:
         return InspectionValidity.VALID
     if facts.files_found or markers or mod_count or wrong_level:
         return InspectionValidity.PROBABLE

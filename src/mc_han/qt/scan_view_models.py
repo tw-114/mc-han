@@ -98,6 +98,9 @@ class ScanProgressViewModel:
     stage_text: str
     source_text: str
     discovered_text: str
+    jar_progress_text: str
+    processed_jars: int
+    total_jars: int
 
     @classmethod
     def from_event(cls, event: ScanProgressEvent) -> "ScanProgressViewModel":
@@ -106,6 +109,13 @@ class ScanProgressViewModel:
             stage_text=event.message,
             source_text=f"当前来源：{source}" if source else "",
             discovered_text=f"已发现 {event.discovered_records:,} 条内容",
+            jar_progress_text=(
+                f"模组进度：{event.processed_jars:,} / {event.total_jars:,}"
+                if event.total_jars
+                else "模组进度：未发现 JAR"
+            ),
+            processed_jars=event.processed_jars,
+            total_jars=event.total_jars,
         )
 
 

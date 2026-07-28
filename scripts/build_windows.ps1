@@ -185,7 +185,8 @@ try {
     Assert-ReleaseContents $ReleaseDirectory
     Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
     & (Join-Path $PSScriptRoot "smoke_windows.ps1") `
-        -ReleaseDirectory $ReleaseDirectory
+        -ReleaseDirectory $ReleaseDirectory `
+        -CheckEndToEnd
 
     $ArchiveName = (& $PythonExe -c "from mc_han.release_info import windows_archive_name; print(windows_archive_name())").Trim()
     if ($LASTEXITCODE -ne 0 -or -not $ArchiveName) {

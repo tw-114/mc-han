@@ -62,6 +62,26 @@ class HomePage(QScrollArea):
         )
         layout.addWidget(select_card)
 
+        workflow_title = QLabel("从整合包到可安装汉化包")
+        workflow_title.setObjectName("SectionTitle")
+        layout.addWidget(workflow_title)
+        workflow_card = Card()
+        workflow_text = QLabel(
+            "1. 选择项目  →  2. 扫描内容  →  3. 配置翻译  →  "
+            "4. 小批量试译\n"
+            "5. 完整翻译  →  6. 译文检查  →  7. 构建与安装"
+        )
+        workflow_text.setObjectName("ValueLabel")
+        workflow_text.setWordWrap(True)
+        workflow_hint = QLabel(
+            "顶部步骤会持续显示当前位置；已完成的步骤可以随时返回检查。"
+        )
+        workflow_hint.setObjectName("MutedLabel")
+        workflow_hint.setWordWrap(True)
+        workflow_card.content_layout.addWidget(workflow_text)
+        workflow_card.content_layout.addWidget(workflow_hint)
+        layout.addWidget(workflow_card)
+
         safety_title = QLabel("检测过程保持只读")
         safety_title.setObjectName("SectionTitle")
         layout.addWidget(safety_title)

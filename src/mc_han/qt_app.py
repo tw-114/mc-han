@@ -19,6 +19,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--e2e-smoke-test",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {get_version()}",
@@ -35,6 +40,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     from mc_han.qt.main_window import run_qt_app
 
     try:
+        if args.e2e_smoke_test:
+            from mc_han.qt.release_smoke import run_packaged_e2e_smoke_test
+
+            return run_packaged_e2e_smoke_test()
         return run_qt_app(smoke_test=args.smoke_test)
     except (ImportError, OSError, RuntimeError) as exc:
         print(f"mc-han 启动失败：{type(exc).__name__}", file=sys.stderr)

@@ -129,7 +129,10 @@ def test_valid_and_probable_can_start_background_scan(
             ScanProgressEvent(
                 ScanProgressStage.SCANNING,
                 "正在扫描",
+                current_source="mods/example.jar",
                 discovered_records=1,
+                processed_jars=1,
+                total_jars=2,
             )
         )
         return make_scan_result()
@@ -140,6 +143,9 @@ def test_valid_and_probable_can_start_background_scan(
 
     process_until(application, lambda: window.stage is WorkflowStage.SCAN_RESULT)
     assert calls == [tmp_path]
+    assert window.scan_page.jar_progress.text() == "模组进度：1 / 2"
+    assert window.scan_page.progress_bar.maximum() == 2
+    assert window.scan_page.progress_bar.value() == 1
     assert window.pages.currentWidget() is window.scan_page
     assert window.scan_page.continue_button.isEnabled()
 

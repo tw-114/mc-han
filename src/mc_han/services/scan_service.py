@@ -16,6 +16,7 @@ from mc_han.csv_store import (
 from mc_han.models import ExtractedText
 from mc_han.scanner import (
     ScanRecords,
+    ScannerProgress,
     merge_existing_translations,
     scan_modpack,
     write_scan_report,
@@ -81,9 +82,27 @@ def scan_and_classify(
         )
 
         _emit(progress, ScanProgressStage.SCANNING, "正在扫描受支持的文本来源")
+        def relay_scan_progress(event: ScannerProgress) -> None:
+            phase_messages = {
+                "ftbquests": "正在扫描 FTB Quests",
+                "filesystem": "正在扫描配置和资源包语言文件",
+                "jars": "正在扫描模组 JAR",
+                "sorting": "正在整理扫描结果",
+            }
+            _emit(
+                progress,
+                ScanProgressStage.SCANNING,
+                phase_messages.get(event.phase, "正在扫描受支持的文本来源"),
+                current_source=event.current_source,
+                discovered_records=event.discovered_records,
+                processed_jars=event.processed_jars,
+                total_jars=event.total_jars,
+            )
+
         records = scan_modpack(
             paths.modpack_dir,
             translate_names=translate_names,
+            progress=relay_scan_progress,
         )
         if not isinstance(records, ScanRecords):
             raise TypeError("scan_modpack returned an invalid result")
@@ -436,13 +455,19 @@ def _emit(
     stage: ScanProgressStage,
     message: str,
     *,
+    current_source: str = "",
     discovered_records: int = 0,
+    processed_jars: int = 0,
+    total_jars: int = 0,
 ) -> None:
     if callback is not None:
         callback(
             ScanProgressEvent(
                 stage=stage,
                 message=message,
+                current_source=current_source,
                 discovered_records=discovered_records,
+                processed_jars=processed_jars,
+                total_jars=total_jars,
             )
         )

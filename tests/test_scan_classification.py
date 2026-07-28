@@ -272,10 +272,11 @@ def test_scan_service_calls_scanner_once_and_reuses_same_records(
     observed: dict[str, object] = {}
     original_classifier = scan_service.classify_scan_records
 
-    def fake_scan(path: Path, *, translate_names: bool = False):
+    def fake_scan(path: Path, *, translate_names: bool = False, progress=None):
         calls["scan"] += 1
         assert path == modpack.resolve()
         assert not translate_names
+        assert progress is not None
         return scanned
 
     def capture_classifier(records: ScanRecords, **kwargs):
@@ -318,9 +319,14 @@ def test_scan_service_emits_controlled_phases_and_writes_real_outputs(
 
     result = scan_and_classify(modpack, progress=events.append)
 
-    assert tuple(event.stage for event in events) == (
+    assert events[0].stage is ScanProgressStage.PREPARING
+    assert any(event.stage is ScanProgressStage.SCANNING for event in events)
+    assert tuple(
+        event.stage
+        for event in events
+        if event.stage is not ScanProgressStage.SCANNING
+    ) == (
         ScanProgressStage.PREPARING,
-        ScanProgressStage.SCANNING,
         ScanProgressStage.CLASSIFYING,
         ScanProgressStage.WRITING,
         ScanProgressStage.COMPLETED,

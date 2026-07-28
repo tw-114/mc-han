@@ -84,6 +84,8 @@ class ScanPage(QScrollArea):
         self.loading_source.setWordWrap(True)
         self.discovered_records = QLabel("已发现 0 条内容")
         self.discovered_records.setObjectName("MutedLabel")
+        self.jar_progress = QLabel("模组进度：正在准备")
+        self.jar_progress.setObjectName("MutedLabel")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         safety = QLabel("扫描只读取受支持内容，不会修改 mods/*.jar，也不会调用翻译 API。")
@@ -93,6 +95,7 @@ class ScanPage(QScrollArea):
         self.loading_card.content_layout.addWidget(self.loading_stage)
         self.loading_card.content_layout.addWidget(self.loading_source)
         self.loading_card.content_layout.addWidget(self.discovered_records)
+        self.loading_card.content_layout.addWidget(self.jar_progress)
         self.loading_card.content_layout.addWidget(self.progress_bar)
         self.loading_card.content_layout.addWidget(safety)
         self.page_layout.addWidget(self.loading_card)
@@ -241,6 +244,7 @@ class ScanPage(QScrollArea):
         self.loading_stage.setText("正在准备")
         self.loading_source.setText("")
         self.discovered_records.setText("已发现 0 条内容")
+        self.jar_progress.setText("模组进度：正在准备")
         self.progress_bar.setRange(0, 0)
         self.loading_card.show()
         self.result_content.hide()
@@ -254,6 +258,12 @@ class ScanPage(QScrollArea):
         self.loading_source.setText(view_model.source_text)
         self.loading_source.setVisible(bool(view_model.source_text))
         self.discovered_records.setText(view_model.discovered_text)
+        self.jar_progress.setText(view_model.jar_progress_text)
+        if view_model.total_jars:
+            self.progress_bar.setRange(0, view_model.total_jars)
+            self.progress_bar.setValue(view_model.processed_jars)
+        else:
+            self.progress_bar.setRange(0, 0)
 
     def show_result(self, view_model: ScanPageViewModel) -> None:
         self.status_chip.setText("扫描完成")
