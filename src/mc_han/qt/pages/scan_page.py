@@ -135,6 +135,20 @@ class ScanPage(QScrollArea):
         summary_card.content_layout.addLayout(summary_grid)
         result_layout.addWidget(summary_card)
 
+        self.incremental_card = Card()
+        self.incremental_title = QLabel("")
+        self.incremental_title.setObjectName("CardTitle")
+        self.incremental_detail = QLabel("")
+        self.incremental_detail.setObjectName("MutedLabel")
+        self.incremental_detail.setWordWrap(True)
+        self.incremental_card.content_layout.addWidget(
+            self.incremental_title
+        )
+        self.incremental_card.content_layout.addWidget(
+            self.incremental_detail
+        )
+        result_layout.addWidget(self.incremental_card)
+
         selection_header = QHBoxLayout()
         category_title = QLabel("选择准备翻译的类别")
         category_title.setObjectName("SectionTitle")
@@ -281,6 +295,14 @@ class ScanPage(QScrollArea):
         self.summary_values["sources"].setText(view_model.total_sources)
         self.summary_values["duration"].setText(view_model.duration)
         self.summary_values["warnings"].setText(view_model.warnings)
+        self.incremental_title.setText(view_model.incremental_title)
+        self.incremental_title.setProperty(
+            "tone",
+            view_model.incremental_tone.value,
+        )
+        self.incremental_title.style().unpolish(self.incremental_title)
+        self.incremental_title.style().polish(self.incremental_title)
+        self.incremental_detail.setText(view_model.incremental_detail)
         self.selection_summary.setText(view_model.selected_summary)
 
         _clear_layout(self.categories_grid)

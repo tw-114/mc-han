@@ -21,6 +21,7 @@ class ProjectPaths:
     output_dir: Path
     logs_dir: Path
     scan_report: Path
+    scan_diff_json: Path
     quality_report_txt: Path
     quality_report_json: Path
     scan_options_json: Path
@@ -44,6 +45,7 @@ def project_paths(modpack_dir: Path) -> ProjectPaths:
         output_dir=output_dir,
         logs_dir=logs_dir,
         scan_report=logs_dir / "scan_report.txt",
+        scan_diff_json=state_dir / "scan_diff.json",
         quality_report_txt=state_dir / "汉化检查报告.txt",
         quality_report_json=state_dir / "quality_report.json",
         scan_options_json=state_dir / "scan_options.json",

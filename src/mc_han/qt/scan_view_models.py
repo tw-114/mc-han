@@ -50,6 +50,9 @@ class ScanPageViewModel:
     duration: str
     warnings: str
     selected_summary: str
+    incremental_title: str
+    incremental_detail: str
+    incremental_tone: StatusTone
     can_continue: bool
     categories: tuple[ScanCategoryCardViewModel, ...]
     information: tuple[ScanInformationCardViewModel, ...]
@@ -73,6 +76,40 @@ class ScanPageViewModel:
         )
         selected = state.selected_record_count
         total = state.total_record_count
+        incremental = state.result.incremental_summary
+        first_baseline = (
+            incremental.added_count == total
+            and incremental.unchanged_count == 0
+            and incremental.source_changed_count == 0
+            and incremental.context_changed_count == 0
+            and incremental.removed_count == 0
+        )
+        if first_baseline:
+            incremental_title = "已建立首次扫描基线"
+            incremental_tone = StatusTone.PRIMARY
+        elif incremental.needs_review_count:
+            incremental_title = (
+                f"更新后有 {incremental.needs_review_count:,} 条需要复核"
+            )
+            incremental_tone = StatusTone.WARNING
+        else:
+            incremental_title = "增量扫描未发现需复核变化"
+            incremental_tone = StatusTone.SUCCESS
+        incremental_detail = (
+            f"可直接复用 {incremental.unchanged_count:,} 条 · "
+            f"新增 {incremental.added_count:,} 条 · "
+            f"英文变化 {incremental.source_changed_count:,} 条 · "
+            f"上下文变化 {incremental.context_changed_count:,} 条 · "
+            f"删除 {incremental.removed_count:,} 条"
+        )
+        if incremental.migrated_manual_count:
+            incremental_detail += (
+                f" · 已保留 {incremental.migrated_manual_count:,} 条人工译文"
+            )
+        if incremental.affected_rule_ids:
+            incremental_detail += (
+                f" · {len(incremental.affected_rule_ids):,} 条规则需要关注"
+            )
         return cls(
             project_name=project_name or "未识别",
             total_records=f"{total:,}",
@@ -83,6 +120,9 @@ class ScanPageViewModel:
             selected_summary=(
                 f"已选择 {selected:,} 条，共 {total:,} 条可翻译内容"
             ),
+            incremental_title=incremental_title,
+            incremental_detail=incremental_detail,
+            incremental_tone=incremental_tone,
             can_continue=selected > 0,
             categories=categories,
             information=information,

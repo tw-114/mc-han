@@ -221,6 +221,52 @@ class TranslationProvenanceStore:
             manual_confirmed=True,
         )
 
+    def migrate_translation_after_update(
+        self,
+        previous: TranslationProvenance | None,
+        record: ExtractedText,
+    ) -> TranslationProvenance:
+        if not record.translation.strip():
+            raise ValueError("translation must not be empty")
+        source = (
+            previous.current_source
+            if previous is not None
+            else TranslationSource.MANUAL
+        )
+        migrated = self.record_translation(
+            record,
+            record.translation,
+            source=source,
+            provider=previous.provider if previous else "",
+            model=previous.model if previous else "",
+            rule_version=previous.rule_version if previous else "",
+            changed_after_update=True,
+        )
+        if previous is None:
+            return migrated
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE translation_provenance
+                SET initial_source = ?,
+                    first_generated_at = ?,
+                    manual_confirmed_at = ?,
+                    changed_after_update = 1
+                WHERE record_id = ?
+                """,
+                (
+                    previous.initial_source.value,
+                    previous.first_generated_at,
+                    previous.manual_confirmed_at,
+                    record.id,
+                ),
+            )
+            self._connection.commit()
+        result = self.get(record.id)
+        if result is None:
+            raise sqlite3.DatabaseError("migrated provenance was not saved")
+        return result
+
     def count_sources(
         self,
         record_ids: set[str] | frozenset[str],
