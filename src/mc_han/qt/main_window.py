@@ -675,12 +675,16 @@ class MainWindow(QMainWindow):
         label: str,
         *,
         cancel: Callable[[], None] | None = None,
+        pause: Callable[[], None] | None = None,
+        resume: Callable[[], None] | None = None,
     ) -> bool:
         started, reason = self.workflow_controller.begin_task(
             kind,
             label,
             task,
             cancel=cancel,
+            pause=pause,
+            resume=resume,
         )
         if not started:
             self._show_action_blocked(reason)
@@ -1230,6 +1234,8 @@ class MainWindow(QMainWindow):
             TaskKind.FULL_TRANSLATION,
             "完整翻译",
             cancel=task.request_stop,
+            pause=task.pause,
+            resume=task.resume,
         ):
             return
         self._full_translated_before_run = sum(
@@ -1334,10 +1340,9 @@ class MainWindow(QMainWindow):
         if self._full_task is None or not self._full_running:
             self._show_action_blocked("当前没有可暂停的完整翻译任务。")
             return
-        self._full_task.pause()
-        self.workflow_controller.update_task_progress(
-            "将在当前批次完成后暂停"
-        )
+        if not self.workflow_controller.pause_active_task():
+            self._show_action_blocked("当前翻译任务暂时无法暂停。")
+            return
         self.full_translation_page.show_pause_requested()
         self.footer_status.setText("将在当前批次完成后暂停")
 
@@ -1346,8 +1351,9 @@ class MainWindow(QMainWindow):
         if self._full_task is None or not self._full_running:
             self._show_action_blocked("当前没有已暂停的完整翻译任务。")
             return
-        self._full_task.resume()
-        self.workflow_controller.update_task_progress("继续翻译")
+        if not self.workflow_controller.resume_active_task():
+            self._show_action_blocked("当前翻译任务尚未暂停。")
+            return
         self.full_translation_page.show_resumed()
         self.footer_status.setText("继续完整翻译")
 
