@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import sqlite3
 from time import perf_counter
 
 from mc_han.core.project import ensure_project_dirs, project_paths
@@ -20,6 +21,10 @@ from mc_han.scanner import (
     merge_existing_translations,
     scan_modpack,
     write_scan_report,
+)
+from mc_han.services.provenance import (
+    TranslationProvenanceStore,
+    reconcile_scan_provenance,
 )
 from mc_han.utils.safe_zip import BAD_ZIP, READ_ERROR, ZipDiagnostic
 from mc_han.workflow.models import ExistingChineseResources
@@ -156,6 +161,13 @@ def scan_and_classify(
                 partial_saved=False,
             ) from error
         saved = True
+        with TranslationProvenanceStore(paths.provenance_sqlite) as store:
+            reconcile_scan_provenance(
+                store,
+                records,
+                existing_records,
+                records.provenance_candidates,
+            )
         write_scan_report(
             modpack_dir=paths.modpack_dir,
             records=records,
@@ -183,7 +195,7 @@ def scan_and_classify(
             retryable=False,
             partial_saved=False,
         ) from error
-    except (OSError, RuntimeError, ValueError, TypeError) as error:
+    except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError) as error:
         raise ScanServiceError(
             code="scan_failed",
             message="扫描未能完成，请检查目录是否仍可访问后重试。",

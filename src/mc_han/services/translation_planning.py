@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from mc_han.models import ExtractedText
+from mc_han.services.provenance import TranslationProvenanceStore
 from mc_han.translator.batching import (
     build_token_batches,
     make_pending_group,
@@ -29,6 +30,7 @@ from mc_han.workflow.translation_plan import (
     TranslationPlanMode,
     TranslationRoute,
 )
+from mc_han.workflow.provenance import TranslationSource
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,7 @@ def build_translation_plan_comparison(
     concurrency: int = 1,
     sqlite_cache_path: Path | None = None,
     jsonl_cache_path: Path | None = None,
+    provenance_path: Path | None = None,
 ) -> TranslationPlanComparison:
     if type(concurrency) is not int or concurrency <= 0:
         raise ValueError("concurrency must be a positive integer")
@@ -102,6 +105,10 @@ def build_translation_plan_comparison(
     eligible = tuple(record for record in selected if not _is_skipped(record))
     historical = tuple(
         record for record in eligible if record.translation.strip()
+    )
+    existing_chinese_ids = _existing_chinese_record_ids(
+        historical,
+        provenance_path=provenance_path,
     )
     missing = tuple(
         record for record in eligible if not record.translation.strip()
@@ -119,6 +126,7 @@ def build_translation_plan_comparison(
             mode,
             selected=selected,
             historical=historical,
+            existing_chinese_ids=existing_chinese_ids,
             cached_ids=cached_ids,
             pending=pending,
             skipped=skipped,
@@ -144,6 +152,7 @@ def _build_plan(
     *,
     selected: tuple[ExtractedText, ...],
     historical: tuple[ExtractedText, ...],
+    existing_chinese_ids: frozenset[str],
     cached_ids: frozenset[str],
     pending: tuple[ExtractedText, ...],
     skipped: tuple[ExtractedText, ...],
@@ -243,8 +252,10 @@ def _build_plan(
         description=description,
         recommended=mode is TranslationPlanMode.BALANCED,
         selected_record_count=len(selected),
-        existing_chinese_reuse_count=0,
-        historical_translation_count=len(historical),
+        existing_chinese_reuse_count=len(existing_chinese_ids),
+        historical_translation_count=(
+            len(historical) - len(existing_chinese_ids)
+        ),
         cache_reuse_count=len(cached_ids),
         ai_translation_count=len(pending),
         skipped_count=len(skipped),
@@ -311,6 +322,31 @@ def _cached_record_ids(
             ):
                 cached.add(record.id)
     return frozenset(cached)
+
+
+def _existing_chinese_record_ids(
+    records: tuple[ExtractedText, ...],
+    *,
+    provenance_path: Path | None,
+) -> frozenset[str]:
+    if provenance_path is None or not Path(provenance_path).is_file():
+        return frozenset()
+    sources = frozenset(
+        {
+            TranslationSource.OFFICIAL_ZH_CN,
+            TranslationSource.MODPACK_AUTHOR,
+            TranslationSource.TRUSTED_RESOURCE_PACK,
+        }
+    )
+    with TranslationProvenanceStore(provenance_path) as store:
+        return frozenset(
+            record.id
+            for record in records
+            if (
+                (provenance := store.get(record.id)) is not None
+                and provenance.current_source in sources
+            )
+        )
 
 
 def _is_skipped(record: ExtractedText) -> bool:

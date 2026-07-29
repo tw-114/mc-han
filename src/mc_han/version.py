@@ -18,7 +18,8 @@ def get_version() -> str:
 
 
 def _source_tree_version() -> str:
-    for parent in Path(__file__).resolve().parents:
+    # Metadata fallback must not depend on resolving unrelated user input paths.
+    for parent in Path(__file__).parent.parents:
         pyproject_path = parent / "pyproject.toml"
         if not pyproject_path.is_file():
             continue

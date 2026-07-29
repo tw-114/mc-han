@@ -14,6 +14,7 @@ class ProjectPaths:
     extracted_csv: Path
     extracted_jsonl: Path
     translations_sqlite: Path
+    provenance_sqlite: Path
     usage_sqlite: Path
     translation_cache_jsonl: Path
     translation_rules_json: Path
@@ -36,6 +37,7 @@ def project_paths(modpack_dir: Path) -> ProjectPaths:
         extracted_csv=state_dir / "extracted_texts.csv",
         extracted_jsonl=state_dir / "extracted_texts.jsonl",
         translations_sqlite=state_dir / "translations.sqlite",
+        provenance_sqlite=state_dir / "provenance.sqlite3",
         usage_sqlite=state_dir / "usage.sqlite3",
         translation_cache_jsonl=state_dir / "translation_cache.jsonl",
         translation_rules_json=state_dir / "translation_rules.json",

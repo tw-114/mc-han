@@ -19,6 +19,7 @@ from mc_han.models import ExtractedText
 from mc_han.quality.checks import extract_resource_ids
 from mc_han.quality.markdown import fenced_code_blocks_closed
 from mc_han.quality.placeholders import placeholders_match
+from mc_han.services.provenance import TranslationProvenanceStore
 from mc_han.usage.ledger import UsageLedger
 from mc_han.usage.models import (
     ApiAttemptUsage,
@@ -29,6 +30,7 @@ from mc_han.usage.models import (
 )
 from mc_han.usage.pricing import estimate_cost, select_pricing_profile
 from mc_han.workflow.scan_models import category_for_record
+from mc_han.workflow.provenance import TranslationSource
 
 from .base import TranslationSegment, Translator
 from .batching import PendingGroup, build_token_batches, make_pending_group, resolve_speed_mode
@@ -148,6 +150,8 @@ def translate_csv(
     usage_ledger_path: Path | None = None,
     usage_task_id: str | None = None,
     pricing_profiles: tuple[PricingProfile, ...] = (),
+    provenance_path: Path | None = None,
+    rule_version: str = "",
 ) -> tuple[list[ExtractedText], int, int]:
     config = resolve_speed_mode(
         speed_mode,
@@ -163,6 +167,11 @@ def translate_csv(
     updated = list(records)
     cache = TranslationCache(cache_path)
     sqlite_cache = SQLiteTranslationCache(sqlite_cache_path) if sqlite_cache_path else None
+    provenance_store = (
+        TranslationProvenanceStore(provenance_path)
+        if provenance_path is not None
+        else None
+    )
     owns_usage_ledger = False
     is_network_provider = bool(
         getattr(translator, "is_network_provider", False)
@@ -204,6 +213,31 @@ def translate_csv(
     pending_order: list[str] = []
     pending_groups: dict[str, list[tuple[int, ExtractedText]]] = {}
 
+    def record_provenance(
+        record: ExtractedText,
+        translation: str,
+        source: TranslationSource,
+    ) -> None:
+        if provenance_store is None:
+            return
+        try:
+            provenance_store.record_translation(
+                record,
+                translation,
+                source=source,
+                provider=translator.provider_name,
+                model=translator.model,
+                rule_version=rule_version,
+            )
+        except (OSError, sqlite3.Error, ValueError):
+            emit_event(
+                event_callback,
+                TranslationTaskDiagnostic(
+                    code="provenance_write_failed",
+                    message="译文已保存，但来源记录暂时未能更新。",
+                ),
+            )
+
     try:
         for index, record in enumerate(records):
             if not record.original.strip():
@@ -242,6 +276,11 @@ def translate_csv(
                         model=translator.model,
                     )
                 cache_hits += 1
+                record_provenance(
+                    record,
+                    cached,
+                    TranslationSource.LOCAL_MEMORY,
+                )
                 emit_event(
                     event_callback,
                     TranslationItemCompleted(
@@ -632,6 +671,17 @@ def translate_csv(
                                 model=translator.model,
                             )
                 write_extracted_csv(updated, output_csv)
+                for group, translation in zip(
+                    batch,
+                    translations,
+                    strict=True,
+                ):
+                    for _index, record in group.rows:
+                        record_provenance(
+                            record,
+                            translation,
+                            TranslationSource.AI,
+                        )
 
             elapsed = max(0.001, perf_counter() - started_at)
             with progress_lock:
@@ -730,6 +780,8 @@ def translate_csv(
     finally:
         if sqlite_cache:
             sqlite_cache.close()
+        if provenance_store:
+            provenance_store.close()
         if owns_usage_ledger and usage_ledger:
             usage_ledger.close()
 

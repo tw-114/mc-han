@@ -15,6 +15,7 @@ from mc_han.csv_store import read_extracted_csv
 from mc_han.qt.translation_config_view_models import TranslationSessionConfig
 from mc_han.qt.translation_config_view_models import create_translator
 from mc_han.services.scan_service import ScanServiceError
+from mc_han.services.provenance import provenance_rule_version
 from mc_han.services.build_install import (
     BuildWorkflowResult,
     ExportWorkflowResult,
@@ -303,6 +304,10 @@ class FullTranslationTask(QRunnable):
                 sqlite_cache_path=paths.translations_sqlite,
                 usage_ledger_path=paths.usage_sqlite,
                 usage_task_id=self._task_id,
+                provenance_path=paths.provenance_sqlite,
+                rule_version=provenance_rule_version(
+                    paths.translation_rules_json
+                ),
                 target_ids=set(self._target_ids),
                 force_ids={
                     record.id

@@ -18,6 +18,7 @@ from mc_han.services.translation_rules import (
     TranslationRuleStore,
     rule_aware_translator,
 )
+from mc_han.services.provenance import provenance_rule_version
 from mc_han.translator.engine import (
     TranslationItemCompleted,
     TranslationItemFailed,
@@ -205,6 +206,10 @@ def run_trial_translation(
             sqlite_cache_path=paths.translations_sqlite,
             usage_ledger_path=paths.usage_sqlite,
             usage_task_id=resolved_task_id,
+            provenance_path=paths.provenance_sqlite,
+            rule_version=provenance_rule_version(
+                paths.translation_rules_json
+            ),
             target_ids=set(selected_ids),
             force_ids={
                 record.id

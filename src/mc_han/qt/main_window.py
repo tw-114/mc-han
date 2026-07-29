@@ -1101,6 +1101,7 @@ class MainWindow(QMainWindow):
                 concurrency=config.concurrency,
                 sqlite_cache_path=paths.translations_sqlite,
                 jsonl_cache_path=paths.translation_cache_jsonl,
+                provenance_path=paths.provenance_sqlite,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             self.translation_plan_comparison = None
