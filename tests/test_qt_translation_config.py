@@ -15,7 +15,9 @@ from mc_han.qt.main_window import MainWindow
 from mc_han.qt.translation_config_view_models import TranslationProvider
 from mc_han.qt.view_models import WorkflowStage
 from mc_han.scanner import ScanRecords
+from mc_han.services.credentials import CredentialStore
 from mc_han.services.scan_service import classify_scan_records
+from mc_han.settings import load_settings
 from mc_han.workflow.models import (
     CAPABILITY_ORDER,
     ChineseResourceStatus,
@@ -95,6 +97,14 @@ def _window_with_scan(tmp_path: Path) -> MainWindow:
     window.current_scan_result = window.scan_selection.result
     window.show_translation_config()
     return window
+
+
+class FakeCipher:
+    def protect(self, value: bytes) -> bytes:
+        return bytes(byte ^ 0x5A for byte in value)
+
+    def unprotect(self, value: bytes) -> bytes:
+        return bytes(byte ^ 0x5A for byte in value)
 
 
 def test_translation_config_page_shows_selection_and_password_control(
@@ -210,3 +220,59 @@ def test_invalid_configuration_stays_on_page(
     assert "必填" in page.validation_label.text()
     assert window.translation_session_config is None
     window.close()
+
+
+def test_secure_key_and_non_sensitive_preferences_restore_across_windows(
+    application: QApplication,
+    tmp_path: Path,
+):
+    credentials_path = tmp_path / "credentials.json"
+    settings_path = tmp_path / "config.json"
+    store = CredentialStore(credentials_path, cipher=FakeCipher())
+    window = MainWindow(
+        credential_store=store,
+        settings_path=settings_path,
+    )
+    window.current_inspection = _inspection(tmp_path)
+    window.scan_selection = _selection()
+    window.current_scan_result = window.scan_selection.result
+    window.show_translation_config()
+    page = window.translation_config_page
+    page.api_key_edit.setText("sk-secure-session")
+    page.model_edit.setText("saved-model")
+    page.concurrency_spin.setValue(2)
+    page.save_api_key_checkbox.setChecked(True)
+
+    window.save_translation_config_and_continue()
+
+    assert "sk-secure-session" not in settings_path.read_text(encoding="utf-8")
+    assert "sk-secure-session" not in credentials_path.read_text(
+        encoding="utf-8"
+    )
+    assert load_settings(settings_path).model == "saved-model"
+    window.close()
+
+    reopened = MainWindow(
+        credential_store=CredentialStore(
+            credentials_path,
+            cipher=FakeCipher(),
+        ),
+        settings_path=settings_path,
+    )
+    reopened.current_inspection = _inspection(tmp_path)
+    reopened.scan_selection = _selection()
+    reopened.current_scan_result = reopened.scan_selection.result
+    reopened.show_translation_config()
+
+    assert reopened.translation_config_page.api_key_edit.text() == (
+        "sk-secure-session"
+    )
+    assert reopened.translation_config_page.model_edit.text() == "saved-model"
+    assert reopened.translation_config_page.concurrency_spin.value() == 2
+    assert reopened.translation_config_page.save_api_key_checkbox.isChecked()
+
+    reopened.show_settings()
+    assert reopened.settings_page.delete_credentials_button.isEnabled()
+    reopened.delete_saved_credentials()
+    assert not credentials_path.exists()
+    reopened.close()

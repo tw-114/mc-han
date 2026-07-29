@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+import sqlite3
 from time import perf_counter
 
 from mc_han.core.project import ensure_project_dirs, project_paths
@@ -21,8 +22,18 @@ from mc_han.scanner import (
     scan_modpack,
     write_scan_report,
 )
+from mc_han.services.provenance import (
+    TranslationProvenanceStore,
+    reconcile_scan_provenance,
+)
+from mc_han.services.incremental_scan import (
+    reconcile_incremental_scan,
+    write_incremental_scan_summary,
+)
+from mc_han.services.translation_rules import TranslationRuleStore
 from mc_han.utils.safe_zip import BAD_ZIP, READ_ERROR, ZipDiagnostic
 from mc_han.workflow.models import ExistingChineseResources
+from mc_han.workflow.incremental import IncrementalScanSummary
 from mc_han.workflow.scan_models import (
     CATEGORY_DEFINITIONS,
     SCAN_CATEGORY_ORDER,
@@ -106,6 +117,20 @@ def scan_and_classify(
         )
         if not isinstance(records, ScanRecords):
             raise TypeError("scan_modpack returned an invalid result")
+        with TranslationProvenanceStore(paths.provenance_sqlite) as store:
+            incremental = reconcile_incremental_scan(
+                records,
+                existing_records,
+                provenance_store=store,
+                rules=TranslationRuleStore(
+                    paths.translation_rules_json
+                ).load(),
+            )
+        records = ScanRecords(
+            list(incremental.records),
+            inventory=records.inventory,
+            provenance_candidates=records.provenance_candidates,
+        )
         if existing_records:
             records = merge_existing_translations(records, existing_records)
         if not isinstance(records, ScanRecords):
@@ -124,6 +149,7 @@ def scan_and_classify(
             scan_duration=elapsed,
             output_csv=paths.extracted_csv.relative_to(paths.modpack_dir).as_posix(),
             report_path=paths.scan_report.relative_to(paths.modpack_dir).as_posix(),
+            incremental_summary=incremental.summary,
         )
 
         _emit(
@@ -156,6 +182,22 @@ def scan_and_classify(
                 partial_saved=False,
             ) from error
         saved = True
+        with TranslationProvenanceStore(paths.provenance_sqlite) as store:
+            reconcile_scan_provenance(
+                store,
+                records,
+                existing_records,
+                records.provenance_candidates,
+            )
+            for migration in incremental.migrations:
+                store.migrate_translation_after_update(
+                    migration.previous_provenance,
+                    migration.current,
+                )
+        write_incremental_scan_summary(
+            paths.scan_diff_json,
+            incremental.summary,
+        )
         write_scan_report(
             modpack_dir=paths.modpack_dir,
             records=records,
@@ -183,7 +225,7 @@ def scan_and_classify(
             retryable=False,
             partial_saved=False,
         ) from error
-    except (OSError, RuntimeError, ValueError, TypeError) as error:
+    except (OSError, sqlite3.Error, RuntimeError, ValueError, TypeError) as error:
         raise ScanServiceError(
             code="scan_failed",
             message="扫描未能完成，请检查目录是否仍可访问后重试。",
@@ -200,6 +242,7 @@ def classify_scan_records(
     scan_duration: float = 0.0,
     output_csv: str = ".mc-han/extracted_texts.csv",
     report_path: str = ".mc-han/logs/scan_report.txt",
+    incremental_summary: IncrementalScanSummary | None = None,
 ) -> ScanClassificationResult:
     if not isinstance(records, ScanRecords):
         raise TypeError("records must be ScanRecords")
@@ -244,6 +287,11 @@ def classify_scan_records(
         scan_duration=scan_duration,
         output_csv=_safe_output_path(output_csv),
         report_path=_safe_output_path(report_path),
+        incremental_summary=(
+            incremental_summary
+            if incremental_summary is not None
+            else IncrementalScanSummary()
+        ),
     )
 
 

@@ -17,6 +17,7 @@ from mc_han.services.trial_translation import (
     run_trial_translation,
     select_trial_samples,
 )
+from mc_han.services.translation_rules import TranslationRuleStore
 from mc_han.translator.base import TranslationSegment
 from mc_han.translator.usage import (
     ProviderAttemptError,
@@ -28,6 +29,10 @@ from mc_han.usage.models import TokenUsage, UsageOutcome
 from mc_han.usage.service import UsageQueryService
 from mc_han.workflow.scan_models import ScanSelectionState
 from mc_han.workflow.trial_models import TrialSampleStatus
+from mc_han.workflow.translation_rules import (
+    TranslationRuleScope,
+    TranslationRuleType,
+)
 
 
 class FakeTrialProvider:
@@ -129,7 +134,7 @@ def test_sample_selection_is_stable_and_prioritizes_categories():
     first = select_trial_samples(records, selection)
     second = select_trial_samples(reversed(records), selection)
 
-    assert len(first) == 10
+    assert len(first) == 8
     assert [item.text_id for item in first] == [
         item.text_id for item in second
     ]
@@ -232,3 +237,55 @@ def test_trial_cache_prevents_later_duplicate_provider_request(tmp_path: Path):
     assert reused.successful_count == 8
     assert all(item.from_cache for item in reused.samples)
     assert reused.usage.api_attempts == 0
+
+
+def test_retry_of_rejected_sample_applies_saved_rule_and_bypasses_old_cache(
+    tmp_path: Path,
+):
+    records = [_record(index) for index in range(8)]
+    paths = project_paths(tmp_path)
+    rejected = replace(
+        records[0],
+        review_status="needs_retranslate",
+        note="needs_retranslate",
+    )
+    records[0] = rejected
+    write_extracted_csv(records, paths.extracted_csv)
+    TranslationRuleStore(paths.translation_rules_json).add_feedback_rule(
+        rejected,
+        rule_type=TranslationRuleType.EXACT,
+        scope=TranslationRuleScope.RECORD,
+        instruction="使用玩家常用说法",
+        source="trial_feedback:wording",
+    )
+    provider = FakeTrialProvider()
+    captured: list[tuple[str, ...]] = []
+    original_method = provider.translate_batch_with_usage
+
+    def capture(segments):
+        captured.extend(segment.instructions for segment in segments)
+        return original_method(segments)
+
+    provider.translate_batch_with_usage = capture
+    samples = select_trial_samples(
+        records,
+        _selection(records),
+        sample_count=8,
+    )
+
+    result = run_trial_translation(
+        tmp_path,
+        _config(),
+        samples,
+        task_id="trial-rule-retry",
+        target_ids=frozenset({rejected.id}),
+        translator_factory=lambda _config: provider,
+    )
+
+    assert captured == [("使用玩家常用说法",)]
+    saved = {
+        item.id: item for item in read_extracted_csv(paths.extracted_csv)
+    }
+    assert saved[rejected.id].translation
+    assert saved[rejected.id].review_status == ""
+    assert result.failed_count == 0

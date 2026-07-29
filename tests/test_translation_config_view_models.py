@@ -112,7 +112,8 @@ def test_recommended_config_uses_existing_provider_presets():
     )
 
     assert deepseek.base_url == "https://api.deepseek.com"
-    assert deepseek.model == "deepseek-chat"
+    assert deepseek.model == "deepseek-v4-flash"
+    assert deepseek.high_quality_model == "deepseek-v4-pro"
     assert openai.base_url == "https://api.openai.com/v1"
     assert custom.base_url == ""
     assert custom.model == ""

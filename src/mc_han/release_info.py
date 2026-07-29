@@ -32,6 +32,6 @@ def about_text(version: str | None = None) -> str:
     return (
         f"mc-han {version or get_version()}\n\n"
         "Minecraft 整合包自动汉化工具\n"
-        "Windows MVP 预览版已接入检测、翻译、检查、构建与安装流程。\n\n"
+        "Windows Beta 已接入可恢复的检测、翻译、检查、构建与安装流程。\n\n"
         "源代码：https://github.com/tw-114/mc-han"
     )

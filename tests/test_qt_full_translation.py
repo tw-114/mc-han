@@ -25,6 +25,7 @@ from mc_han.qt.translation_config_view_models import (
 from mc_han.qt.view_models import WorkflowStage
 from mc_han.scanner import ScanRecords
 from mc_han.services.scan_service import classify_scan_records
+from mc_han.services.translation_rules import TranslationRuleStore
 from mc_han.translator.base import TranslationSegment
 from mc_han.translator.usage import (
     ProviderAttemptError,
@@ -54,6 +55,11 @@ from mc_han.workflow.trial_models import (
     TrialSampleStatus,
     TrialTranslationResult,
 )
+from mc_han.workflow.translation_rules import (
+    TranslationRuleScope,
+    TranslationRuleType,
+)
+from mc_han.qt.project_session import TaskKind
 
 
 @pytest.fixture(scope="module")
@@ -81,6 +87,7 @@ class FakeFullProvider:
         self.started = started
         self.release = release
         self.calls: list[tuple[str, ...]] = []
+        self.instruction_calls: list[tuple[tuple[str, ...], ...]] = []
         self.called_on_main_thread: list[bool] = []
         self.application_thread = QApplication.instance().thread()
 
@@ -90,6 +97,9 @@ class FakeFullProvider:
     ) -> ProviderAttemptResult:
         ids = tuple(segment.id for segment in segments)
         self.calls.append(ids)
+        self.instruction_calls.append(
+            tuple(segment.instructions for segment in segments)
+        )
         self.called_on_main_thread.append(
             QThread.currentThread() is self.application_thread
         )
@@ -321,6 +331,10 @@ def test_full_translation_uses_existing_engine_after_user_click(
     assert "0.001000 USD" in (
         window.full_translation_page.summary_values["cost"].text()
     )
+    assert (
+        window.full_translation_page.summary_values["api_new"].text()
+        != "-"
+    )
     _close_window(application, window)
 
 
@@ -387,6 +401,87 @@ def test_completed_trial_selection_skips_full_provider(
         window.stage
         is WorkflowStage.TRANSLATION_REVIEW
     )
+    _close_window(application, window)
+
+
+def test_full_translation_applies_saved_rule_to_retranslate_record(
+    application: QApplication,
+    tmp_path: Path,
+):
+    provider = FakeFullProvider()
+    records = [
+        _record("trial", translation="试译结果"),
+        ExtractedText(
+            **{
+                **_record("pending").__dict__,
+                "review_status": "needs_retranslate",
+                "note": "needs_retranslate",
+            }
+        ),
+    ]
+    paths = project_paths(tmp_path)
+    TranslationRuleStore(paths.translation_rules_json).add_feedback_rule(
+        records[1],
+        rule_type=TranslationRuleType.EXACT,
+        scope=TranslationRuleScope.RECORD,
+        instruction="使用玩家常用译法",
+        source="trial_feedback:wording",
+    )
+    window = _window(tmp_path, records, provider)
+
+    window.confirm_trial_translation()
+    window.start_full_translation()
+    _process_until(
+        application,
+        lambda: window.stage is WorkflowStage.TRANSLATION_REVIEW,
+    )
+
+    assert provider.instruction_calls == [(("使用玩家常用译法",),)]
+    saved = {
+        record.id: record
+        for record in read_extracted_csv(paths.extracted_csv)
+    }
+    assert saved["pending"].review_status == ""
+    _close_window(application, window)
+
+
+def test_budget_limit_requests_safe_pause_without_losing_page(
+    application: QApplication,
+    tmp_path: Path,
+):
+    provider = FakeFullProvider()
+    records = [
+        _record("trial", translation="试译结果"),
+        _record("pending"),
+    ]
+    window = _window(tmp_path, records, provider)
+    worker = object()
+    pause_calls: list[str] = []
+    started, _reason = window.workflow_controller.begin_task(
+        TaskKind.FULL_TRANSLATION,
+        "完整翻译",
+        worker,
+        pause=lambda: pause_calls.append("pause"),
+        resume=lambda: None,
+    )
+    assert started
+    window._full_running = True
+    window._budget_limit_usd = Decimal("1")
+    window._full_usage = TranslationUsageSummary(
+        reported_cost_total=Decimal("1"),
+        reported_cost_currency="USD",
+        reported_cost_complete=True,
+    )
+
+    window._apply_budget_boundary()
+
+    assert pause_calls == ["pause"]
+    assert window.session.active_task is not None
+    assert window.session.active_task.paused
+    assert window.stage is WorkflowStage.TRIAL_TRANSLATION
+    assert "预算上限" in window.footer_status.text()
+    window._full_running = False
+    window.workflow_controller.finish_task(worker)
     _close_window(application, window)
 
 

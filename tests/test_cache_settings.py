@@ -144,7 +144,7 @@ def test_sqlite_cache_key_includes_context_hash(tmp_path: Path):
         sqlite_cache.close()
 
 
-def test_settings_save_load_and_mask(tmp_path: Path):
+def test_settings_save_load_omits_plaintext_api_key(tmp_path: Path):
     config_path = tmp_path / "config.json"
 
     saved_path = save_settings(
@@ -162,8 +162,9 @@ def test_settings_save_load_and_mask(tmp_path: Path):
     assert saved_path == config_path
     assert loaded.provider == "deepseek"
     assert loaded.model == "deepseek-chat"
-    assert loaded.api_key == "sk-test-123456"
-    assert masked_api_key(loaded.api_key) == "sk-t...3456"
+    assert loaded.api_key is None
+    assert "sk-test-123456" not in config_path.read_text(encoding="utf-8")
+    assert masked_api_key("sk-test-123456") == "sk-t...3456"
 
 
 def test_resolve_translation_settings_uses_saved_config(monkeypatch, tmp_path: Path):
@@ -184,7 +185,7 @@ def test_resolve_translation_settings_uses_saved_config(monkeypatch, tmp_path: P
 
     assert resolved.provider == "deepseek"
     assert resolved.model == "deepseek-chat"
-    assert resolved.api_key == "saved-key"
+    assert resolved.api_key is None
     assert resolved.limit == 20
 
 

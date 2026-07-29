@@ -14,11 +14,15 @@ class ProjectPaths:
     extracted_csv: Path
     extracted_jsonl: Path
     translations_sqlite: Path
+    provenance_sqlite: Path
     usage_sqlite: Path
     translation_cache_jsonl: Path
+    translation_rules_json: Path
     output_dir: Path
     logs_dir: Path
     scan_report: Path
+    scan_diff_json: Path
+    install_history_json: Path
     quality_report_txt: Path
     quality_report_json: Path
     scan_options_json: Path
@@ -35,11 +39,15 @@ def project_paths(modpack_dir: Path) -> ProjectPaths:
         extracted_csv=state_dir / "extracted_texts.csv",
         extracted_jsonl=state_dir / "extracted_texts.jsonl",
         translations_sqlite=state_dir / "translations.sqlite",
+        provenance_sqlite=state_dir / "provenance.sqlite3",
         usage_sqlite=state_dir / "usage.sqlite3",
         translation_cache_jsonl=state_dir / "translation_cache.jsonl",
+        translation_rules_json=state_dir / "translation_rules.json",
         output_dir=output_dir,
         logs_dir=logs_dir,
         scan_report=logs_dir / "scan_report.txt",
+        scan_diff_json=state_dir / "scan_diff.json",
+        install_history_json=state_dir / "install_history.json",
         quality_report_txt=state_dir / "汉化检查报告.txt",
         quality_report_json=state_dir / "quality_report.json",
         scan_options_json=state_dir / "scan_options.json",

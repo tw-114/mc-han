@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,11 +14,16 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QLabel
 
+from mc_han.models import ExtractedText
 from mc_han.qt.main_window import MainWindow
 from mc_han.qt.task_runner import InspectionTask
 from mc_han.qt.view_models import WorkflowStage
 from mc_han.scanner import ScanRecords
 from mc_han.services.scan_service import classify_scan_records
+from mc_han.services.recent_projects import (
+    RecentProject,
+    RecentProjectsStore,
+)
 from mc_han.version import get_version
 from mc_han.workflow.models import (
     CAPABILITY_ORDER,
@@ -77,24 +83,63 @@ def test_window_smoke_and_home_content(application: QApplication):
     assert "尚无最近项目" in labels
     assert "从整合包到可安装汉化包" in labels
     assert any(
-        "7. 构建与安装" in label.text()
+        "1. 整合包" in label.text()
         for label in window.findChildren(QLabel)
     )
     assert f"v{get_version()}" in labels
     assert window.home_page.select_button.text() == "选择整合包"
     assert [button.text() for button in window.workflow_step_buttons] == [
-        "1. 选择项目",
-        "2. 扫描内容",
-        "3. 配置翻译",
-        "4. 小批量试译",
-        "5. 完整翻译",
-        "6. 译文检查",
-        "7. 构建与安装",
+        "1. 整合包",
+        "2. 汉化",
+        "3. 安装",
     ]
     assert window.workflow_step_buttons[0].isChecked()
     assert not window.workflow_step_buttons[1].isEnabled()
-    assert "请先选择" in window.workflow_step_buttons[1].toolTip()
+    assert "扫描" in window.workflow_step_buttons[1].toolTip()
 
+    window.close()
+    application.processEvents()
+
+
+def test_home_shows_recent_project_and_continues_it(
+    application: QApplication,
+    tmp_path: Path,
+):
+    project_path = tmp_path / "Demo"
+    project_path.mkdir()
+    store = RecentProjectsStore(tmp_path / "projects.json")
+    store.upsert(
+        RecentProject(
+            path=project_path,
+            display_name="Demo Pack",
+            minecraft_version="1.21.1",
+            loader_name="NeoForge",
+            last_opened="2026-01-01T00:00:00+00:00",
+        )
+    )
+    inspected: list[Path] = []
+
+    def inspect_recent(path: Path) -> ModpackInspection:
+        inspected.append(path)
+        return replace(make_result(InspectionValidity.VALID), input_directory=path)
+
+    window = MainWindow(
+        recent_projects_store=store,
+        project_discovery_service=lambda _paths: (),
+        inspection_service=inspect_recent,
+    )
+    assert window.home_page.continue_button.isVisibleTo(window)
+    assert "Demo Pack" in window.home_page.continue_button.text()
+
+    window.home_page.continue_button.click()
+    process_until(
+        application,
+        lambda: window.stage is WorkflowStage.INSPECTION_RESULT,
+    )
+
+    assert inspected == [project_path]
+    assert store.load().most_recent is not None
+    assert store.load().most_recent.last_page == "inspection"
     window.close()
     application.processEvents()
 
@@ -121,25 +166,45 @@ def test_completed_workflow_step_can_return(
     application: QApplication,
 ):
     def fake_scan(*_args, **_kwargs):
-        return classify_scan_records(ScanRecords(), scan_duration=0.1)
+        return classify_scan_records(
+            ScanRecords(
+                [
+                    ExtractedText(
+                        id="demo",
+                        source_type="jar_lang",
+                        container="mods/demo.jar",
+                        file_path="assets/demo/lang/en_us.json",
+                        key_path="demo.text",
+                        original="Demo text",
+                    )
+                ],
+                inventory={},
+            ),
+            scan_duration=0.1,
+        )
 
     window = MainWindow(scan_service=fake_scan)
     inspection = make_result(InspectionValidity.VALID)
     window._inspection_completed(inspection)
 
     assert window.workflow_step_buttons[0].isChecked()
-    assert window.workflow_step_buttons[1].isEnabled()
-    window.workflow_step_buttons[1].click()
+    window.workflow_step_buttons[0].click()
     process_until(
         application,
         lambda: window.stage is WorkflowStage.SCAN_RESULT,
     )
     assert window.pages.currentWidget() is window.scan_page
+    assert window.workflow_step_buttons[0].isChecked()
+    assert window.workflow_step_buttons[1].isEnabled()
+
+    window.workflow_step_buttons[1].click()
+    application.processEvents()
+    assert window.pages.currentWidget() is window.translation_plan_page
     assert window.workflow_step_buttons[1].isChecked()
 
     window.workflow_step_buttons[0].click()
     application.processEvents()
-    assert window.pages.currentWidget() is window.inspection_page
+    assert window.pages.currentWidget() is window.scan_page
     assert window.workflow_step_buttons[0].isChecked()
     window.close()
 

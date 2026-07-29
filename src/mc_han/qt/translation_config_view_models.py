@@ -25,8 +25,13 @@ PROVIDER_DISPLAY_NAMES = {
 }
 
 RECOMMENDED_MODELS = {
-    TranslationProvider.DEEPSEEK: "deepseek-chat",
+    TranslationProvider.DEEPSEEK: "deepseek-v4-flash",
     TranslationProvider.OPENAI: "gpt-4o-mini",
+    TranslationProvider.OPENAI_COMPATIBLE: "",
+}
+RECOMMENDED_HIGH_QUALITY_MODELS = {
+    TranslationProvider.DEEPSEEK: "deepseek-v4-pro",
+    TranslationProvider.OPENAI: "gpt-4.1",
     TranslationProvider.OPENAI_COMPATIBLE: "",
 }
 
@@ -41,6 +46,7 @@ class TranslationSessionConfig:
     base_url: str
     model: str
     api_key: str = field(repr=False)
+    high_quality_model: str = ""
     concurrency: int = DEFAULT_CONCURRENCY
     batch_size: int = DEFAULT_BATCH_SIZE
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
@@ -48,7 +54,12 @@ class TranslationSessionConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.provider, TranslationProvider):
             raise TypeError("provider must be a TranslationProvider")
-        for field_name in ("base_url", "model", "api_key"):
+        for field_name in (
+            "base_url",
+            "model",
+            "api_key",
+            "high_quality_model",
+        ):
             value = getattr(self, field_name)
             if not isinstance(value, str):
                 raise TypeError(f"{field_name} must be a string")
@@ -62,6 +73,7 @@ class TranslationSessionConfig:
             "provider": self.provider.value,
             "base_url": self.base_url,
             "model": self.model,
+            "high_quality_model": self.high_quality_model,
             "concurrency": self.concurrency,
             "batch_size": self.batch_size,
             "timeout_seconds": self.timeout_seconds,
@@ -120,6 +132,7 @@ def recommended_translation_config(
         base_url=preset.base_url if preset is not None else "",
         model=RECOMMENDED_MODELS[provider],
         api_key=api_key,
+        high_quality_model=RECOMMENDED_HIGH_QUALITY_MODELS[provider],
     )
 
 

@@ -100,6 +100,18 @@ class BuildInstallPage(QScrollArea):
         summary.content_layout.addWidget(self.output_directory_label)
         layout.addWidget(summary)
 
+        install_plan = Card()
+        install_plan_title = QLabel("安装前确认")
+        install_plan_title.setObjectName("CardTitle")
+        self.install_plan_label = QLabel(
+            "生成后会列出新增与覆盖文件；安装前将再次请求确认。"
+        )
+        self.install_plan_label.setObjectName("MutedLabel")
+        self.install_plan_label.setWordWrap(True)
+        install_plan.content_layout.addWidget(install_plan_title)
+        install_plan.content_layout.addWidget(self.install_plan_label)
+        layout.addWidget(install_plan)
+
         diagnostics = Card()
         diagnostic_title = QLabel("警告与检查")
         diagnostic_title.setObjectName("CardTitle")
@@ -113,6 +125,9 @@ class BuildInstallPage(QScrollArea):
         self.feedback_label = QLabel("")
         self.feedback_label.setWordWrap(True)
         self.feedback_label.hide()
+        self.install_plan_label.setText(
+            "生成后会列出新增与覆盖文件；安装前将再次请求确认。"
+        )
         layout.addWidget(self.feedback_label)
 
         actions = QHBoxLayout()
@@ -186,6 +201,10 @@ class BuildInstallPage(QScrollArea):
             self.status_detail.setText(
                 "可以导出 ZIP，或安装到当前整合包。"
             )
+        self.install_plan_label.setText(
+            f"{view_model.install_text}。安装前会备份被覆盖的文件到 "
+            ".mc-han/backups/<安装时间>；不会修改 mods/*.jar。"
+        )
 
     def show_failure(self, message: str) -> None:
         self.status_title.setText("操作失败")

@@ -99,6 +99,11 @@ class CompletionPageViewModel:
             detail=(
                 f"已安装 {result.installed_files:,} 个文件，"
                 f"备份 {result.backed_up_files:,} 个原有文件。"
+                + (
+                    f"\n{result.history_warning}"
+                    if result.history_warning
+                    else ""
+                )
             ),
             location=(
                 str(result.manifest_path)
@@ -118,6 +123,11 @@ class CompletionPageViewModel:
             detail=(
                 f"恢复 {result.restored_files:,} 个文件，"
                 f"移除 {result.removed_files:,} 个新文件。"
+                + (
+                    f"\n{result.history_warning}"
+                    if result.history_warning
+                    else ""
+                )
             ),
             location=str(result.manifest_path),
             can_rollback=False,

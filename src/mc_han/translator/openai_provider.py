@@ -84,6 +84,9 @@ class OpenAICompatibleTranslator:
                                     "file_path": segment.file_path,
                                     "key_path": segment.key_path,
                                     "text": protected.text,
+                                    "instructions": list(
+                                        segment.instructions
+                                    ),
                                 }
                                 for segment, protected in protected_segments
                             ],

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from mc_han.builder.resourcepack import (
     resource_pack_format_for_version,
 )
 from mc_han.quality.checks import check_output_dir
+from mc_han.services.install_history import InstallHistoryStore
 
 
 EXPORT_ARCHIVE_NAME = "mc-han-cn.zip"
@@ -139,10 +141,22 @@ def install_localization_package(
     modpack_dir: Path,
     output_dir: Path,
 ) -> InstallResult:
-    return install_outputs(
+    result = install_outputs(
         modpack_dir=modpack_dir,
         build_dir=output_dir,
     )
+    try:
+        InstallHistoryStore(modpack_dir).record_install(result)
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return replace(
+            result,
+            history_saved=False,
+            history_warning=(
+                "安装已完成，但安装历史未能保存。"
+                "备份 manifest 仍可用于撤销。"
+            ),
+        )
+    return result
 
 
 def rollback_localization_install(
@@ -150,7 +164,19 @@ def rollback_localization_install(
     modpack_dir: Path,
     backup_dir: Path,
 ) -> RollbackResult:
-    return rollback_install(
+    result = rollback_install(
         modpack_dir=modpack_dir,
         backup_dir=backup_dir,
     )
+    try:
+        InstallHistoryStore(modpack_dir).mark_rolled_back(result)
+    except (OSError, RuntimeError, ValueError):
+        return replace(
+            result,
+            history_saved=False,
+            history_warning=(
+                "文件已恢复，但安装历史状态未能更新。"
+                "回滚报告已经保留。"
+            ),
+        )
+    return result

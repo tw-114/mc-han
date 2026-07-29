@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$PythonExe = ""
+    [string]$PythonExe = "",
+    [string]$BuildDirectory = "build",
+    [string]$DistDirectory = "dist"
 )
 
 $ErrorActionPreference = "Stop"
@@ -142,12 +144,17 @@ function Assert-ReleaseContents {
 
 Push-Location $RepoRoot
 try {
-    Remove-ReleaseDirectory "build"
-    Remove-ReleaseDirectory "dist"
+    Remove-ReleaseDirectory $BuildDirectory
+    Remove-ReleaseDirectory $DistDirectory
 
-    $TestTemp = Join-Path $RepoRoot "build\pytest-temp"
+    $BuildRoot = Join-Path $RepoRoot $BuildDirectory
+    $DistRoot = Join-Path $RepoRoot $DistDirectory
+    $TestTemp = Join-Path $BuildRoot "pytest-temp"
+    $IsolatedUserBase = Join-Path $BuildRoot "python-user"
     New-Item -ItemType Directory -Path $TestTemp -Force | Out-Null
+    New-Item -ItemType Directory -Path $IsolatedUserBase -Force | Out-Null
     $env:PYTHONNOUSERSITE = "1"
+    $env:PYTHONUSERBASE = $IsolatedUserBase
     $env:QT_QPA_PLATFORM = "offscreen"
     $env:TEMP = $TestTemp
     $env:TMP = $TestTemp
@@ -168,13 +175,13 @@ try {
         "--noconfirm",
         "--clean",
         "--distpath",
-        (Join-Path $RepoRoot "dist"),
+        $DistRoot,
         "--workpath",
-        (Join-Path $RepoRoot "build"),
+        $BuildRoot,
         (Join-Path $RepoRoot "packaging\mc-han-qt.spec")
     )
 
-    $ReleaseDirectory = Join-Path $RepoRoot "dist\mc-han"
+    $ReleaseDirectory = Join-Path $DistRoot "mc-han"
     Prune-UnusedQtComponents $ReleaseDirectory
     Copy-Item -LiteralPath (Join-Path $RepoRoot "README.md") `
         -Destination (Join-Path $ReleaseDirectory "README.md")
@@ -192,7 +199,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $ArchiveName) {
         throw "Could not derive the release archive name."
     }
-    $ArchivePath = Join-Path $RepoRoot "dist\$ArchiveName"
+    $ArchivePath = Join-Path $DistRoot $ArchiveName
     Compress-Archive -LiteralPath $ReleaseDirectory -DestinationPath $ArchivePath -CompressionLevel Optimal
 
     $Digest = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -200,7 +207,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $ChecksumName) {
         throw "Could not derive the release checksum name."
     }
-    $ChecksumPath = Join-Path $RepoRoot "dist\$ChecksumName"
+    $ChecksumPath = Join-Path $DistRoot $ChecksumName
     [System.IO.File]::WriteAllText(
         $ChecksumPath,
         "$Digest  $ArchiveName`n",

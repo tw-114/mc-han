@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Any, Iterable
 
 from mc_han.models import ExtractedText
+from mc_han.workflow.incremental import IncrementalScanSummary
 
 
 class ScanCategoryId(str, Enum):
@@ -292,6 +293,7 @@ class ScanClassificationResult:
     scan_duration: float
     output_csv: str
     report_path: str
+    incremental_summary: IncrementalScanSummary = IncrementalScanSummary()
 
     def __post_init__(self) -> None:
         categories = tuple(self.categories)
@@ -332,6 +334,13 @@ class ScanClassificationResult:
             str,
         ):
             raise TypeError("output paths must be strings")
+        if not isinstance(
+            self.incremental_summary,
+            IncrementalScanSummary,
+        ):
+            raise TypeError(
+                "incremental_summary must be IncrementalScanSummary"
+            )
         calculated_total = sum(
             item.record_count for item in categories if item.translatable
         )

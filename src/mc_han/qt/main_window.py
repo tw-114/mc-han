@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
@@ -41,6 +43,7 @@ from mc_han.qt.pages.inspection_page import InspectionPage
 from mc_han.qt.pages.scan_page import ScanPage
 from mc_han.qt.pages.settings_page import SettingsPage
 from mc_han.qt.pages.translation_config_page import TranslationConfigPage
+from mc_han.qt.pages.translation_plan_page import TranslationPlanPage
 from mc_han.qt.pages.trial_translation_page import TrialTranslationPage
 from mc_han.qt.pages.translation_review_page import TranslationReviewPage
 from mc_han.qt.project_session import (
@@ -62,7 +65,10 @@ from mc_han.qt.task_runner import (
     TaskFailure,
     TrialTranslationTask,
 )
-from mc_han.qt.theme import application_stylesheet
+from mc_han.qt.theme import (
+    ThemeManager,
+    ThemePreference,
+)
 from mc_han.qt.translation_config_view_models import (
     TranslationConfigPageViewModel,
     TranslationProvider,
@@ -72,6 +78,9 @@ from mc_han.qt.translation_config_view_models import (
     with_recommended_values,
     create_translator,
 )
+from mc_han.qt.translation_plan_view_models import (
+    TranslationPlanPageViewModel,
+)
 from mc_han.qt.trial_view_models import TrialPageViewModel
 from mc_han.qt.translation_review_view_models import (
     TranslationReviewPageViewModel,
@@ -79,6 +88,16 @@ from mc_han.qt.translation_review_view_models import (
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
+from mc_han.services.credentials import CredentialStore, MemoryCredentialStore
+from mc_han.services.project_discovery import (
+    DiscoveredProject,
+    discover_modpacks,
+)
+from mc_han.services.recent_projects import (
+    MemoryRecentProjectsStore,
+    RecentProject,
+    RecentProjectsStore,
+)
 from mc_han.services.build_install import (
     BuildWorkflowResult,
     ExportWorkflowResult,
@@ -87,7 +106,12 @@ from mc_han.services.build_install import (
     install_localization_package,
     rollback_localization_install,
 )
+from mc_han.services.install_history import recover_latest_install_result
 from mc_han.services.scan_service import scan_and_classify
+from mc_han.services.translation_planning import (
+    build_translation_plan_comparison,
+)
+from mc_han.services.translation_rules import TranslationRuleStore
 from mc_han.services.trial_translation import (
     TrialTranslationError,
     prepare_trial_samples,
@@ -97,6 +121,12 @@ from mc_han.services.translation_review import (
     ReviewAction,
     load_translation_review,
     update_translation_review_record,
+)
+from mc_han.settings import (
+    UserSettings,
+    config_path,
+    load_settings,
+    save_settings,
 )
 from mc_han.version import UNKNOWN_VERSION, get_version
 from mc_han.workflow.models import ModpackInspection
@@ -108,12 +138,30 @@ from mc_han.workflow.scan_models import (
     ScanProgressEvent,
     ScanSelectionState,
 )
-from mc_han.translator.engine import TranslationProgress, TranslationStarted
+from mc_han.translator.engine import (
+    TranslationBatchCompleted,
+    TranslationItemCompleted,
+    TranslationItemFailed,
+    TranslationProgress,
+    TranslationStarted,
+)
+from mc_han.usage.ledger import UsageLedger
+from mc_han.usage.service import UsageQueryService
 from mc_han.usage.models import TranslationUsageSummary
 from mc_han.workflow.trial_models import (
     TrialProgressEvent,
     TrialSampleResult,
     TrialTranslationResult,
+    TrialSampleStatus,
+)
+from mc_han.workflow.translation_plan import (
+    TranslationPlan,
+    TranslationPlanComparison,
+    TranslationPlanMode,
+)
+from mc_han.workflow.translation_rules import (
+    TranslationRuleScope,
+    TranslationRuleType,
 )
 
 
@@ -130,33 +178,36 @@ BuildService = Callable[..., BuildWorkflowResult]
 ExportService = Callable[..., ExportWorkflowResult]
 InstallService = Callable[..., InstallResult]
 RollbackService = Callable[..., RollbackResult]
+InstallConfirmationProvider = Callable[[BuildWorkflowResult], bool]
 DirectoryOpener = Callable[[Path], bool]
 CloseDecisionProvider = Callable[[str, bool], CloseDecision]
+ProjectDiscoveryService = Callable[
+    [Sequence[Path]],
+    tuple[DiscoveredProject, ...],
+]
+TranslationPlanningService = Callable[..., TranslationPlanComparison]
 
 WORKFLOW_STEP_LABELS = (
-    "选择项目",
-    "扫描内容",
-    "配置翻译",
-    "小批量试译",
-    "完整翻译",
-    "译文检查",
-    "构建与安装",
+    "整合包",
+    "汉化",
+    "安装",
 )
 
 STAGE_STEP_INDEX = {
     WorkflowStage.WELCOME: 0,
     WorkflowStage.INSPECTING: 0,
     WorkflowStage.INSPECTION_RESULT: 0,
-    WorkflowStage.SCANNING: 1,
-    WorkflowStage.SCAN_RESULT: 1,
-    WorkflowStage.TRANSLATION_CONFIG: 2,
-    WorkflowStage.TRIAL_TRANSLATION: 3,
-    WorkflowStage.FULL_TRANSLATION: 4,
-    WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER: 5,
-    WorkflowStage.TRANSLATION_REVIEW: 5,
-    WorkflowStage.BUILD_PLACEHOLDER: 6,
-    WorkflowStage.BUILD_INSTALL: 6,
-    WorkflowStage.COMPLETION: 6,
+    WorkflowStage.SCANNING: 0,
+    WorkflowStage.SCAN_RESULT: 0,
+    WorkflowStage.TRANSLATION_PLAN: 1,
+    WorkflowStage.TRANSLATION_CONFIG: 1,
+    WorkflowStage.TRIAL_TRANSLATION: 1,
+    WorkflowStage.FULL_TRANSLATION: 1,
+    WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER: 1,
+    WorkflowStage.TRANSLATION_REVIEW: 1,
+    WorkflowStage.BUILD_PLACEHOLDER: 2,
+    WorkflowStage.BUILD_INSTALL: 2,
+    WorkflowStage.COMPLETION: 2,
 }
 
 
@@ -173,9 +224,18 @@ class MainWindow(QMainWindow):
         export_service: ExportService = export_localization_zip,
         install_service: InstallService = install_localization_package,
         rollback_service: RollbackService = rollback_localization_install,
+        install_confirmation_provider: InstallConfirmationProvider | None = None,
         directory_opener: DirectoryOpener | None = None,
         directory_picker: DirectoryPicker | None = None,
         close_decision_provider: CloseDecisionProvider | None = None,
+        recent_projects_store: RecentProjectsStore | None = None,
+        project_discovery_service: ProjectDiscoveryService | None = None,
+        credential_store: CredentialStore | None = None,
+        settings_path: Path | None = None,
+        translation_planning_service: TranslationPlanningService = (
+            build_translation_plan_comparison
+        ),
+        theme_manager: ThemeManager | None = None,
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
@@ -187,16 +247,52 @@ class MainWindow(QMainWindow):
         self._export_service = export_service
         self._install_service = install_service
         self._rollback_service = rollback_service
+        self._install_confirmation_provider = (
+            install_confirmation_provider
+            or self._confirm_install_plan
+        )
         self._directory_opener = directory_opener or self._open_directory
         self._directory_picker = directory_picker or self._choose_directory
         self._close_decision_provider = (
             close_decision_provider or self._prompt_close_decision
         )
+        self._recent_projects_store = (
+            recent_projects_store or MemoryRecentProjectsStore()
+        )
+        self._project_discovery_service = (
+            project_discovery_service
+            or (lambda _manual_paths: ())
+        )
+        self._credential_store = credential_store or MemoryCredentialStore()
+        self._settings_path = Path(settings_path) if settings_path else None
+        self._translation_planning_service = translation_planning_service
+        self._saved_settings = (
+            load_settings(self._settings_path)
+            if self._settings_path is not None
+            else UserSettings()
+        )
+        application = QApplication.instance()
+        if application is None:
+            raise RuntimeError("QApplication must exist before MainWindow")
+        self._owns_theme_manager = theme_manager is None
+        self.theme_manager = theme_manager or ThemeManager(
+            application,
+            preference=_saved_theme_preference(self._saved_settings),
+        )
+        self._recent_projects = self._recent_projects_store.load()
+        self._discovered_projects: tuple[DiscoveredProject, ...] = ()
+        self._last_directory = self._recent_projects.last_directory
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
         self.workflow_controller = WorkflowController(self)
         self.session: ProjectSession = self.workflow_controller.session
         self.workflow_controller.changed.connect(self._session_changed)
+        self._project_save_timer = QTimer(self)
+        self._project_save_timer.setSingleShot(True)
+        self._project_save_timer.setInterval(350)
+        self._project_save_timer.timeout.connect(
+            self._persist_project_progress
+        )
         self._inspection_running = False
         self._scan_running = False
         self._trial_running = False
@@ -209,6 +305,11 @@ class MainWindow(QMainWindow):
         self.scan_selection: ScanSelectionState | None = None
         self.translation_config_draft: TranslationSessionConfig | None = None
         self.translation_session_config: TranslationSessionConfig | None = None
+        self.translation_plan_comparison: TranslationPlanComparison | None = None
+        self.selected_translation_plan: TranslationPlan | None = None
+        self._translation_plan_mode = _saved_plan_mode(self._saved_settings)
+        self._budget_limit_usd = _saved_budget(self._saved_settings)
+        self._config_returns_to_plan = False
         self.trial_samples: tuple[TrialSampleResult, ...] = ()
         self.trial_result: TrialTranslationResult | None = None
         self._trial_task_id = ""
@@ -221,6 +322,10 @@ class MainWindow(QMainWindow):
         self._full_translated_before_run = 0
         self._full_elapsed_previous = 0.0
         self._full_started_at = 0.0
+        self._full_usage = TranslationUsageSummary()
+        self._full_activity: list[str] = []
+        self._full_budget_warning_emitted = False
+        self._full_last_progress: TranslationProgress | None = None
         self._build_result: BuildWorkflowResult | None = None
         self._install_result: InstallResult | None = None
         self._export_result: ExportWorkflowResult | None = None
@@ -232,7 +337,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("mc-han")
         self.resize(1120, 720)
         self.setMinimumSize(920, 620)
-        self.setStyleSheet(application_stylesheet())
 
         root = QWidget()
         root.setObjectName("AppRoot")
@@ -245,6 +349,7 @@ class MainWindow(QMainWindow):
         self.home_page = HomePage()
         self.inspection_page = InspectionPage()
         self.scan_page = ScanPage()
+        self.translation_plan_page = TranslationPlanPage()
         self.translation_config_page = TranslationConfigPage()
         self.trial_translation_page = TrialTranslationPage()
         self.full_translation_page = FullTranslationPage()
@@ -255,6 +360,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
         self.pages.addWidget(self.scan_page)
+        self.pages.addWidget(self.translation_plan_page)
         self.pages.addWidget(self.translation_config_page)
         self.pages.addWidget(self.trial_translation_page)
         self.pages.addWidget(self.full_translation_page)
@@ -266,6 +372,7 @@ class MainWindow(QMainWindow):
             self.home_page: "home",
             self.inspection_page: "inspection",
             self.scan_page: "scan",
+            self.translation_plan_page: "translation_plan",
             self.translation_config_page: "translation_config",
             self.trial_translation_page: "trial_translation",
             self.full_translation_page: "full_translation",
@@ -281,14 +388,18 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
+        self.theme_manager.apply(self)
 
         self.home_page.select_requested.connect(self.choose_and_inspect)
+        self.home_page.project_requested.connect(
+            lambda path: self.start_inspection(Path(path))
+        )
         self.inspection_page.reselect_requested.connect(self.choose_and_inspect)
         self.inspection_page.home_requested.connect(self.show_home)
         self.inspection_page.scan_requested.connect(self.start_scan)
         self.scan_page.back_requested.connect(self.show_inspection_result)
         self.scan_page.rescan_requested.connect(self.start_scan)
-        self.scan_page.continue_requested.connect(self.show_translation_config)
+        self.scan_page.continue_requested.connect(self.show_translation_plan)
         self.scan_page.select_all_requested.connect(self.select_all_scan_categories)
         self.scan_page.clear_selection_requested.connect(
             self.clear_scan_categories
@@ -297,6 +408,21 @@ class MainWindow(QMainWindow):
             self.restore_scan_category_defaults
         )
         self.scan_page.category_toggled.connect(self.set_scan_category_selected)
+        self.translation_plan_page.back_requested.connect(
+            self.show_scan_result
+        )
+        self.translation_plan_page.advanced_requested.connect(
+            self.show_translation_config_from_plan
+        )
+        self.translation_plan_page.continue_requested.connect(
+            self.confirm_translation_plan
+        )
+        self.translation_plan_page.mode_changed.connect(
+            self.change_translation_plan_mode
+        )
+        self.translation_plan_page.budget_changed.connect(
+            self.change_translation_budget
+        )
         self.translation_config_page.back_requested.connect(
             self.return_to_scan_from_translation_config
         )
@@ -313,7 +439,7 @@ class MainWindow(QMainWindow):
             self.change_translation_provider
         )
         self.trial_translation_page.back_requested.connect(
-            self.show_translation_config
+            self.show_translation_plan
         )
         self.trial_translation_page.start_requested.connect(
             self.start_trial_translation
@@ -323,6 +449,12 @@ class MainWindow(QMainWindow):
         )
         self.trial_translation_page.continue_requested.connect(
             self.confirm_trial_translation
+        )
+        self.trial_translation_page.satisfied_requested.connect(
+            self.mark_trial_sample_satisfied
+        )
+        self.trial_translation_page.feedback_requested.connect(
+            self.save_trial_feedback
         )
         self.full_translation_page.back_requested.connect(
             self.show_trial_translation_result
@@ -355,7 +487,7 @@ class MainWindow(QMainWindow):
             self.skip_review_record
         )
         self.translation_review_page.retranslate_placeholder_requested.connect(
-            self.show_retranslate_placeholder
+            self.mark_review_record_for_retranslation
         )
         self.translation_review_page.continue_requested.connect(
             self.show_build_install
@@ -381,6 +513,13 @@ class MainWindow(QMainWindow):
             self.start_install_rollback
         )
         self.settings_page.back_requested.connect(self.close_settings)
+        self.settings_page.delete_credentials_requested.connect(
+            self.delete_saved_credentials
+        )
+        self.settings_page.theme_changed.connect(
+            self.change_theme_preference
+        )
+        self._refresh_home_projects()
         self.show_home()
 
     def _build_top_bar(self) -> QFrame:
@@ -483,6 +622,8 @@ class MainWindow(QMainWindow):
             self.activity_progress_label.setText(task.progress)
         self._refresh_step_navigation()
         self._refresh_disabled_reasons()
+        if self.current_inspection is not None:
+            self._project_save_timer.start()
 
     @Slot(int)
     def _current_page_changed(self, index: int) -> None:
@@ -527,43 +668,18 @@ class MainWindow(QMainWindow):
         if index == 1:
             return (
                 bool(
-                    self.current_inspection is not None
-                    and self.current_inspection.can_continue
-                ),
-                "请先选择并识别整合包",
-            )
-        if index == 2:
-            return (
-                bool(
                     self.scan_selection is not None
                     and self.scan_selection.selected_record_count > 0
                 ),
-                "请先扫描并选择需要翻译的内容",
+                "请先完成整合包扫描并选择需要汉化的内容",
             )
-        if index == 3:
-            return (
-                self.translation_session_config is not None,
-                "请先完成翻译服务配置",
-            )
-        if index == 4:
-            return (
-                bool(self._full_selected_ids),
-                "请先完成小批量试译并确认结果",
-            )
-        if index == 5:
-            return self._review_unlocked, "请先完成完整翻译"
-        return self._build_unlocked, "请先进入译文检查"
+        return self._build_unlocked, "请先完成汉化并进入译文检查"
 
     def _step_completed(self, index: int) -> bool:
         completed = (
-            self.current_inspection is not None,
             self.current_scan_result is not None,
-            self.translation_session_config is not None,
-            self.trial_result is not None
-            and self.trial_result.successful_count > 0,
             self._review_unlocked,
-            self._build_unlocked,
-            self._build_result is not None,
+            self._install_result is not None,
         )
         return completed[index]
 
@@ -576,24 +692,44 @@ class MainWindow(QMainWindow):
         if not enabled:
             self._show_action_blocked(reason)
             return
-        if index == 1 and self.current_scan_result is None:
-            self.start_scan()
+        if index == 0:
+            if (
+                self.current_inspection is not None
+                and self.current_scan_result is None
+                and self.current_inspection.can_continue
+            ):
+                self.start_scan()
+            elif self.current_scan_result is not None:
+                self.show_scan_result()
+            elif self.current_inspection is not None:
+                self.show_inspection_result()
+            else:
+                self.show_home()
             return
-        actions = (
-            self.show_inspection_result
-            if self.current_inspection is not None
-            else self.show_home,
-            self.show_scan_result,
-            self.show_translation_config,
-            self.show_trial_translation_result,
-            self.show_full_translation_result,
-            self.show_translation_review,
-            self.show_build_install,
-        )
-        actions[index]()
+        if index == 1:
+            if self._review_unlocked:
+                self.show_translation_review()
+            elif self._full_selected_ids:
+                self.show_full_translation_result()
+            elif self.translation_session_config is not None:
+                self.show_trial_translation_result()
+            else:
+                self.show_translation_plan()
+            return
+        if self._install_result is not None:
+            self._show_page(self.completion_page)
+            self.stage = WorkflowStage.COMPLETION
+        else:
+            self.show_build_install()
 
     @Slot()
     def show_settings(self) -> None:
+        self.theme_manager.refresh_system_theme()
+        self.settings_page.set_theme(
+            self.theme_manager.preference.value,
+            self.theme_manager.effective_theme.value,
+        )
+        self._refresh_credential_status()
         self.workflow_controller.open_settings()
         self._show_page(self.settings_page, force=True)
         self.footer_status.setText("设置")
@@ -605,6 +741,32 @@ class MainWindow(QMainWindow):
         self._show_page(page, force=True)
         self._refresh_step_navigation()
         self.footer_status.setText(self._session_status_text())
+
+    @Slot(object)
+    def change_theme_preference(self, value: object) -> None:
+        try:
+            preference = ThemePreference(str(value))
+        except ValueError:
+            self._show_action_blocked("无法识别所选主题。")
+            return
+        self.theme_manager.set_preference(preference)
+        self._saved_settings = replace(
+            self._saved_settings,
+            theme_mode=preference.value,
+        )
+        self.settings_page.set_theme(
+            preference.value,
+            self.theme_manager.effective_theme.value,
+        )
+        if self._settings_path is not None:
+            try:
+                save_settings(self._saved_settings, path=self._settings_path)
+            except OSError:
+                self.settings_page.theme_status.setText(
+                    "主题已切换，但未能保存到本机设置。"
+                )
+                return
+        self.footer_status.setText("主题已更新")
 
     def _refresh_disabled_reasons(self) -> None:
         if not hasattr(self, "pages"):
@@ -675,12 +837,16 @@ class MainWindow(QMainWindow):
         label: str,
         *,
         cancel: Callable[[], None] | None = None,
+        pause: Callable[[], None] | None = None,
+        resume: Callable[[], None] | None = None,
     ) -> bool:
         started, reason = self.workflow_controller.begin_task(
             kind,
             label,
             task,
             cancel=cancel,
+            pause=pause,
+            resume=resume,
         )
         if not started:
             self._show_action_blocked(reason)
@@ -760,6 +926,8 @@ class MainWindow(QMainWindow):
         self.inspection_page.show_result(
             InspectionPageViewModel.from_inspection(inspection)
         )
+        self._restore_install_history(inspection.input_directory)
+        self._remember_inspection(inspection)
         self._close_if_pending()
 
     @Slot(object)
@@ -887,6 +1055,7 @@ class MainWindow(QMainWindow):
             self._show_action_blocked(self._active_task_reason())
             return
         self.stage = WorkflowStage.WELCOME
+        self._refresh_home_projects()
         self._show_page(self.home_page)
         self.footer_status.setText("准备就绪")
 
@@ -913,6 +1082,122 @@ class MainWindow(QMainWindow):
         self._render_scan_result()
 
     @Slot()
+    def show_translation_plan(self) -> None:
+        if (
+            self.scan_selection is None
+            or self.scan_selection.selected_record_count == 0
+            or self.current_inspection is None
+        ):
+            self._show_action_blocked(
+                "请先扫描并选择至少一个需要翻译的类别。"
+            )
+            return
+        paths = project_paths(self.current_inspection.input_directory)
+        config = (
+            self.translation_config_draft
+            or self.translation_session_config
+            or self._saved_translation_config()
+        )
+        try:
+            records = read_extracted_csv(paths.extracted_csv)
+            comparison = self._translation_planning_service(
+                records,
+                self.scan_selection,
+                provider=config.provider.value,
+                base_model=config.model,
+                high_quality_model=config.high_quality_model,
+                concurrency=config.concurrency,
+                sqlite_cache_path=paths.translations_sqlite,
+                jsonl_cache_path=paths.translation_cache_jsonl,
+                provenance_path=paths.provenance_sqlite,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.translation_plan_comparison = None
+            self.selected_translation_plan = None
+            self.translation_plan_page.show_failure(
+                "扫描清单或翻译缓存暂时无法读取。"
+                f"请返回扫描页面重试（{type(error).__name__}）。"
+            )
+        else:
+            self.translation_plan_comparison = comparison
+            self.selected_translation_plan = comparison.for_mode(
+                self._translation_plan_mode
+            )
+            self.translation_plan_page.set_budget(self._budget_limit_usd)
+            self._render_translation_plan()
+        self._config_returns_to_plan = False
+        self.stage = WorkflowStage.TRANSLATION_PLAN
+        self._show_page(self.translation_plan_page)
+        self.footer_status.setText("比较翻译方案")
+
+    @Slot()
+    def show_translation_config_from_plan(self) -> None:
+        self._config_returns_to_plan = True
+        self.show_translation_config()
+
+    @Slot(object)
+    def change_translation_plan_mode(
+        self,
+        mode: TranslationPlanMode,
+    ) -> None:
+        if (
+            not isinstance(mode, TranslationPlanMode)
+            or self.translation_plan_comparison is None
+        ):
+            return
+        self._translation_plan_mode = mode
+        self.selected_translation_plan = (
+            self.translation_plan_comparison.for_mode(mode)
+        )
+        self._save_plan_preferences()
+        self._render_translation_plan()
+
+    @Slot(object)
+    def change_translation_budget(self, budget: Decimal | None) -> None:
+        if budget is not None and (
+            not isinstance(budget, Decimal) or budget <= 0
+        ):
+            return
+        self._budget_limit_usd = budget
+        self._save_plan_preferences()
+        self._render_translation_plan()
+
+    def _render_translation_plan(self) -> None:
+        if self.selected_translation_plan is None:
+            return
+        self.translation_plan_page.show_plan(
+            TranslationPlanPageViewModel.from_plan(
+                self.selected_translation_plan,
+                self._budget_limit_usd,
+            )
+        )
+
+    @Slot()
+    def confirm_translation_plan(self) -> None:
+        if self.selected_translation_plan is None:
+            self._show_action_blocked("请先生成并选择一个翻译方案。")
+            return
+        if self.selected_translation_plan.exceeds_budget(
+            self._budget_limit_usd
+        ):
+            self._show_action_blocked("预计费用超过预算，请先调整方案或预算。")
+            return
+        config = (
+            self.translation_session_config
+            or self.translation_config_draft
+            or self._saved_translation_config()
+        )
+        if not validate_translation_config(config).valid:
+            self._config_returns_to_plan = True
+            self.show_translation_config()
+            self.translation_config_page.show_validation(
+                validate_translation_config(config)
+            )
+            return
+        self.translation_session_config = config
+        self._prepare_trial_and_show()
+
+    @Slot()
     def show_translation_config(self) -> None:
         if self.scan_selection is None or self.scan_selection.selected_record_count == 0:
             self._show_action_blocked(
@@ -922,7 +1207,7 @@ class MainWindow(QMainWindow):
         config = (
             self.translation_config_draft
             or self.translation_session_config
-            or recommended_translation_config()
+            or self._saved_translation_config()
         )
         self.translation_config_page.show_config(
             TranslationConfigPageViewModel(
@@ -931,6 +1216,20 @@ class MainWindow(QMainWindow):
                 selected_category_count=len(
                     self.scan_selection.selected_category_ids
                 ),
+            )
+        )
+        persisted = self._credential_store.contains_persisted(
+            config.provider.value,
+            config.base_url,
+        )
+        self.translation_config_page.save_api_key_checkbox.setChecked(
+            persisted
+        )
+        self.translation_config_page.show_credential_status(
+            (
+                "已从 Windows 安全凭据存储加载 API Key。"
+                if persisted
+                else "不勾选时，API Key 仅保留在当前程序会话。"
             )
         )
         self.stage = WorkflowStage.TRANSLATION_CONFIG
@@ -942,7 +1241,10 @@ class MainWindow(QMainWindow):
         self.translation_config_draft = (
             self.translation_config_page.current_config()
         )
-        self.show_scan_result()
+        if self._config_returns_to_plan:
+            self.show_translation_plan()
+        else:
+            self.show_scan_result()
 
     @Slot(object)
     def change_translation_provider(
@@ -980,6 +1282,13 @@ class MainWindow(QMainWindow):
         if not validation.valid:
             return
         self.translation_session_config = config
+        self._save_translation_preferences(config)
+        if self._config_returns_to_plan:
+            self.show_translation_plan()
+            return
+        self._prepare_trial_and_show()
+
+    def _prepare_trial_and_show(self) -> None:
         if self.current_inspection is None or self.scan_selection is None:
             return
         try:
@@ -1008,6 +1317,128 @@ class MainWindow(QMainWindow):
         self.stage = WorkflowStage.TRIAL_TRANSLATION
         self._show_page(self.trial_translation_page)
         self.footer_status.setText("等待确认试译")
+
+    def _saved_translation_config(self) -> TranslationSessionConfig:
+        settings = self._saved_settings
+        try:
+            provider = TranslationProvider(
+                settings.provider or TranslationProvider.DEEPSEEK.value
+            )
+        except ValueError:
+            provider = TranslationProvider.DEEPSEEK
+        recommended = recommended_translation_config(provider)
+        base_url = settings.base_url or recommended.base_url
+        api_key = self._credential_store.load(provider.value, base_url) or ""
+        return replace(
+            recommended,
+            base_url=base_url,
+            model=settings.model or recommended.model,
+            high_quality_model=(
+                settings.high_quality_model
+                or recommended.high_quality_model
+            ),
+            api_key=api_key,
+            concurrency=settings.worker_count or recommended.concurrency,
+            batch_size=settings.max_batch_items or recommended.batch_size,
+            timeout_seconds=(
+                settings.timeout_seconds or recommended.timeout_seconds
+            ),
+        )
+
+    def _save_translation_preferences(
+        self,
+        config: TranslationSessionConfig,
+    ) -> None:
+        credential_message = "API Key 仅保留在当前程序会话。"
+        if self.translation_config_page.save_api_key_checkbox.isChecked():
+            result = self._credential_store.save(
+                config.provider.value,
+                config.base_url,
+                config.api_key,
+            )
+            credential_message = result.message
+        self.translation_config_page.show_credential_status(
+            credential_message
+        )
+        self._saved_settings = replace(
+            self._saved_settings,
+            provider=config.provider.value,
+            model=config.model,
+            high_quality_model=config.high_quality_model,
+            base_url=config.base_url,
+            worker_count=config.concurrency,
+            max_batch_items=config.batch_size,
+            timeout_seconds=config.timeout_seconds,
+            plan_mode=self._translation_plan_mode.value,
+            budget_limit_usd=(
+                str(self._budget_limit_usd)
+                if self._budget_limit_usd is not None
+                else None
+            ),
+        )
+        if self._settings_path is None:
+            return
+        try:
+            save_settings(
+                self._saved_settings,
+                path=self._settings_path,
+            )
+        except OSError:
+            self.translation_config_page.show_credential_status(
+                f"{credential_message} 非敏感设置未能保存，但本次会话可继续。"
+            )
+
+    def _save_plan_preferences(self) -> None:
+        self._saved_settings = replace(
+            self._saved_settings,
+            plan_mode=self._translation_plan_mode.value,
+            budget_limit_usd=(
+                str(self._budget_limit_usd)
+                if self._budget_limit_usd is not None
+                else None
+            ),
+        )
+        if self._settings_path is None:
+            return
+        try:
+            save_settings(self._saved_settings, path=self._settings_path)
+        except OSError:
+            self.footer_status.setText(
+                "方案已应用于本次会话，但预算设置未能保存"
+            )
+
+    def _refresh_credential_status(self) -> None:
+        descriptors = self._credential_store.descriptors()
+        if descriptors:
+            self.settings_page.show_credential_status(
+                f"已安全保存 {len(descriptors)} 个翻译服务的 API Key。",
+                can_delete=True,
+            )
+        elif self._credential_store.has_session_credentials:
+            self.settings_page.show_credential_status(
+                "API Key 仅保留在当前程序会话，关闭软件后将清除。",
+                can_delete=True,
+            )
+        elif self._credential_store.last_warning:
+            self.settings_page.show_credential_status(
+                self._credential_store.last_warning,
+                can_delete=False,
+            )
+        else:
+            self.settings_page.show_credential_status(
+                "尚未保存 API Key。",
+                can_delete=False,
+            )
+
+    @Slot()
+    def delete_saved_credentials(self) -> None:
+        deleted = self._credential_store.delete_all()
+        self._refresh_credential_status()
+        self.footer_status.setText(
+            "已删除保存的 API Key"
+            if deleted
+            else "当前没有可删除的 API Key"
+        )
 
     @Slot()
     def start_trial_translation(self) -> None:
@@ -1110,6 +1541,149 @@ class MainWindow(QMainWindow):
         )
         self.footer_status.setText("试译未完成")
         self._close_if_pending()
+
+    @Slot(str)
+    def mark_trial_sample_satisfied(self, text_id: str) -> None:
+        if self.current_inspection is None:
+            return
+        csv_path = project_paths(
+            self.current_inspection.input_directory
+        ).extracted_csv
+        try:
+            update_translation_review_record(
+                csv_path,
+                text_id,
+                ReviewAction.APPROVE,
+            )
+        except (OSError, ValueError):
+            self.trial_translation_page.show_feedback(
+                "未能保存确认状态，译文内容没有被改动。",
+                error=True,
+            )
+            return
+        self.trial_translation_page.show_feedback(
+            "已标记满意，人工确认将优先于后续 AI 与缓存结果。"
+        )
+
+    @Slot(object)
+    def save_trial_feedback(self, payload: object) -> None:
+        if self.current_inspection is None or not isinstance(payload, dict):
+            return
+        text_id = payload.get("text_id")
+        reason = payload.get("reason")
+        scope_value = payload.get("scope")
+        instruction = payload.get("instruction")
+        if not all(
+            isinstance(value, str)
+            for value in (text_id, reason, scope_value, instruction)
+        ):
+            self.trial_translation_page.show_feedback(
+                "修改要求格式无效，请重新填写。",
+                error=True,
+            )
+            return
+        instruction = instruction.strip()
+        if not instruction:
+            self.trial_translation_page.show_feedback(
+                "请先填写希望怎样修改这条译文。",
+                error=True,
+            )
+            return
+        try:
+            scope = TranslationRuleScope(scope_value)
+        except ValueError:
+            self.trial_translation_page.show_feedback(
+                "请选择有效的应用范围。",
+                error=True,
+            )
+            return
+        paths = project_paths(self.current_inspection.input_directory)
+        try:
+            records = read_extracted_csv(paths.extracted_csv)
+            record = next(item for item in records if item.id == text_id)
+        except (OSError, ValueError, StopIteration):
+            self.trial_translation_page.show_feedback(
+                "找不到对应的扫描记录，请重新扫描后再试。",
+                error=True,
+            )
+            return
+        rule_store = self._translation_rule_store(paths.translation_rules_json)
+        rule_type = {
+            "wording": TranslationRuleType.EXACT,
+            "tone": TranslationRuleType.STYLE,
+            "terminology": TranslationRuleType.TERMINOLOGY,
+            "machine": TranslationRuleType.STYLE,
+            "custom": TranslationRuleType.STYLE,
+        }.get(reason, TranslationRuleType.STYLE)
+        try:
+            rule = rule_store.add_feedback_rule(
+                record,
+                rule_type=rule_type,
+                scope=scope,
+                instruction=instruction,
+                source=f"trial_feedback:{reason}",
+            )
+            update_translation_review_record(
+                paths.extracted_csv,
+                text_id,
+                ReviewAction.NEEDS_RETRANSLATE,
+            )
+        except (OSError, ValueError):
+            if "rule" in locals():
+                try:
+                    rule_store.set_enabled(rule.rule_id, False)
+                except (OSError, ValueError):
+                    pass
+            self.trial_translation_page.show_feedback(
+                "修改要求未能完整保存，原译文仍可在检查页处理。",
+                error=True,
+            )
+            return
+        self._mark_trial_sample_for_retry(text_id)
+        resolution = rule_store.resolve(record)
+        conflict_text = (
+            f"；另有 {len(resolution.conflicts)} 条冲突规则未采用"
+            if resolution.conflicts
+            else ""
+        )
+        self.trial_translation_page.show_feedback(
+            f"修改要求已保存到“{_scope_label(scope)}”，"
+            f"该样本已加入重试列表{conflict_text}。"
+        )
+
+    def _mark_trial_sample_for_retry(self, text_id: str) -> None:
+        if self.trial_result is None:
+            return
+        samples = tuple(
+            replace(
+                sample,
+                translation="",
+                status=TrialSampleStatus.FAILED,
+                from_cache=False,
+            )
+            if sample.text_id == text_id
+            else sample
+            for sample in self.trial_result.samples
+        )
+        self.trial_result = replace(self.trial_result, samples=samples)
+        self.trial_samples = samples
+        self.trial_translation_page.show_result(
+            TrialPageViewModel.from_result(self.trial_result)
+        )
+
+    def _translation_rule_store(
+        self,
+        project_path: Path,
+    ) -> TranslationRuleStore:
+        global_path = (
+            self._settings_path.parent / "translation_rules.json"
+            if self._settings_path is not None
+            else None
+        )
+        return TranslationRuleStore(
+            project_path,
+            global_path=global_path,
+        )
 
     @Slot()
     def confirm_trial_translation(self) -> None:
@@ -1230,6 +1804,8 @@ class MainWindow(QMainWindow):
             TaskKind.FULL_TRANSLATION,
             "完整翻译",
             cancel=task.request_stop,
+            pause=task.pause,
+            resume=task.resume,
         ):
             return
         self._full_translated_before_run = sum(
@@ -1240,6 +1816,11 @@ class MainWindow(QMainWindow):
         self._full_running = True
         self._refresh_step_navigation()
         self._full_started_at = perf_counter()
+        self._full_usage = self._read_full_usage(paths.usage_sqlite)
+        self._full_activity.append("已开始完整翻译，成功批次会立即保存。")
+        self.full_translation_page.show_activity(
+            tuple(self._full_activity)
+        )
         self.full_translation_page.show_running(
             retry=(
                 self._full_result is not None
@@ -1260,6 +1841,7 @@ class MainWindow(QMainWindow):
     def _full_progress(self, progress: TranslationProgress) -> None:
         if not self._full_running:
             return
+        self._full_last_progress = progress
         self.workflow_controller.update_task_progress(
             f"{progress.completed_rows:,}/{progress.total_rows:,} · "
             f"成功 {progress.translated_rows:,} · 失败 {progress.failed_rows:,}"
@@ -1275,26 +1857,98 @@ class MainWindow(QMainWindow):
                     + perf_counter()
                     - self._full_started_at
                 ),
+                usage=self._full_usage,
+                budget=self._budget_limit_usd,
             )
         )
 
     @Slot(object)
     def _full_translation_event(self, event: object) -> None:
-        if not self._full_running or not isinstance(
-            event,
-            TranslationStarted,
-        ):
+        if not self._full_running:
             return
-        category_id = SOURCE_TYPE_TO_CATEGORY.get(
-            event.source_type,
-            ScanCategoryId.OTHER_SUPPORTED,
+        if isinstance(event, TranslationStarted):
+            category_id = SOURCE_TYPE_TO_CATEGORY.get(
+                event.source_type,
+                ScanCategoryId.OTHER_SUPPORTED,
+            )
+            self._full_current_category = CATEGORY_DEFINITIONS[
+                category_id
+            ].title
+            self.full_translation_page.show_current_category(
+                self._full_current_category
+            )
+            self._append_full_activity(
+                f"正在处理 {self._full_current_category} · "
+                f"{event.file_path or event.text_id}"
+            )
+        elif isinstance(event, TranslationItemCompleted):
+            preview = " ".join(event.translation.split())
+            self._append_full_activity(
+                f"{event.status} · {event.file_path or event.text_id} · "
+                f"{preview[:80]}"
+            )
+        elif isinstance(event, TranslationItemFailed):
+            self._append_full_activity(
+                f"需要处理 · {event.file_path or event.text_id}"
+            )
+        elif isinstance(event, TranslationBatchCompleted):
+            if self.current_inspection is None:
+                return
+            usage_path = project_paths(
+                self.current_inspection.input_directory
+            ).usage_sqlite
+            self._full_usage = self._read_full_usage(usage_path)
+            self._apply_budget_boundary()
+            if self._full_last_progress is not None:
+                self._full_progress(self._full_last_progress)
+
+    def _append_full_activity(self, message: str) -> None:
+        self._full_activity.append(message)
+        del self._full_activity[:-100]
+        self.full_translation_page.show_activity(
+            tuple(self._full_activity)
         )
-        self._full_current_category = CATEGORY_DEFINITIONS[
-            category_id
-        ].title
-        self.full_translation_page.show_current_category(
-            self._full_current_category
+
+    def _read_full_usage(self, path: Path) -> TranslationUsageSummary:
+        if not Path(path).is_file() or not self._full_task_id:
+            return TranslationUsageSummary()
+        try:
+            with UsageLedger(path) as ledger:
+                return UsageQueryService(ledger).task_summary(
+                    self._full_task_id
+                )
+        except (OSError, sqlite3.Error, ValueError):
+            return TranslationUsageSummary()
+
+    def _apply_budget_boundary(self) -> None:
+        budget = self._budget_limit_usd
+        if budget is None or budget <= 0:
+            return
+        amount = (
+            self._full_usage.reported_cost_total
+            if self._full_usage.reported_cost_total is not None
+            else self._full_usage.estimated_cost
         )
+        if amount is None:
+            return
+        if (
+            amount >= budget
+            and self.session.active_task is not None
+            and not self.session.active_task.paused
+        ):
+            if self.workflow_controller.pause_active_task():
+                self.full_translation_page.show_pause_requested()
+                self._append_full_activity(
+                    "已达到预算上限，当前请求完成后已安全暂停。"
+                )
+                self.footer_status.setText("已达到预算上限并安全暂停")
+            return
+        if (
+            not self._full_budget_warning_emitted
+            and amount >= budget * Decimal("0.8")
+        ):
+            self._full_budget_warning_emitted = True
+            self._append_full_activity("费用已达到预算的 80%。")
 
     @Slot(object)
     def _full_completed(
@@ -1307,11 +1961,13 @@ class MainWindow(QMainWindow):
         self._refresh_step_navigation()
         self._full_elapsed_previous += result.elapsed_seconds
         self._full_result = result
+        self._full_usage = result.usage
         self._full_pending_ids = result.remaining_ids
         view_model = FullTranslationPageViewModel.from_result(
             result,
             current_category=self._full_current_category,
             elapsed_seconds=self._full_elapsed_previous,
+            budget=self._budget_limit_usd,
         )
         self.full_translation_page.show_result(view_model)
         self.footer_status.setText("完整翻译任务结束")
@@ -1334,10 +1990,9 @@ class MainWindow(QMainWindow):
         if self._full_task is None or not self._full_running:
             self._show_action_blocked("当前没有可暂停的完整翻译任务。")
             return
-        self._full_task.pause()
-        self.workflow_controller.update_task_progress(
-            "将在当前批次完成后暂停"
-        )
+        if not self.workflow_controller.pause_active_task():
+            self._show_action_blocked("当前翻译任务暂时无法暂停。")
+            return
         self.full_translation_page.show_pause_requested()
         self.footer_status.setText("将在当前批次完成后暂停")
 
@@ -1346,8 +2001,9 @@ class MainWindow(QMainWindow):
         if self._full_task is None or not self._full_running:
             self._show_action_blocked("当前没有已暂停的完整翻译任务。")
             return
-        self._full_task.resume()
-        self.workflow_controller.update_task_progress("继续翻译")
+        if not self.workflow_controller.resume_active_task():
+            self._show_action_blocked("当前翻译任务尚未暂停。")
+            return
         self.full_translation_page.show_resumed()
         self.footer_status.setText("继续完整翻译")
 
@@ -1378,7 +2034,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.translation_review_page.show_review(
-            TranslationReviewPageViewModel.from_data(records, issues)
+            self._translation_review_view_model(records, issues)
         )
 
     @Slot(str, str)
@@ -1410,7 +2066,7 @@ class MainWindow(QMainWindow):
         self._apply_review_action(
             record_id,
             ReviewAction.NEEDS_RETRANSLATE,
-            success_message="已标记为需要重译，本轮不会调用 API。",
+            success_message="已加入重译列表，本轮没有调用 API。",
         )
 
     @Slot(str)
@@ -1449,10 +2105,32 @@ class MainWindow(QMainWindow):
             )
             return
         self.translation_review_page.show_review(
-            TranslationReviewPageViewModel.from_data(records, issues),
+            self._translation_review_view_model(records, issues),
             selected_id=record_id,
         )
         self.translation_review_page.show_feedback(success_message)
+
+    def _translation_review_view_model(
+        self,
+        records,
+        issues,
+    ) -> TranslationReviewPageViewModel:
+        cost = (
+            self._full_usage.reported_cost_total
+            if self._full_usage.reported_cost_total is not None
+            else self._full_usage.estimated_cost
+        )
+        currency = (
+            self._full_usage.reported_cost_currency
+            if self._full_usage.reported_cost_total is not None
+            else self._full_usage.estimated_cost_currency
+        )
+        return TranslationReviewPageViewModel.from_data(
+            records,
+            issues,
+            cost_amount=cost,
+            cost_currency=currency,
+        )
 
     @Slot(str)
     def show_retranslate_placeholder(self, _record_id: str) -> None:
@@ -1574,6 +2252,11 @@ class MainWindow(QMainWindow):
                 or "请先成功生成可安装的资源包。"
             )
             return
+        if not self._install_confirmation_provider(self._build_result):
+            self.build_install_page.show_feedback(
+                "已取消安装，生成结果和现有整合包文件均未改变。"
+            )
+            return
         task = InstallTask(
             modpack_dir=self.current_inspection.input_directory,
             output_dir=self._build_result.output_dir,
@@ -1593,6 +2276,10 @@ class MainWindow(QMainWindow):
     def _install_completed(self, result: InstallResult) -> None:
         self._finish_build_operation()
         self._install_result = result
+        self._update_recent_install_status(
+            installed=True,
+            can_rollback=result.manifest_path is not None,
+        )
         self.completion_page.show_result(
             CompletionPageViewModel.installed(result)
         )
@@ -1631,6 +2318,10 @@ class MainWindow(QMainWindow):
     def _rollback_completed(self, result: RollbackResult) -> None:
         self._finish_build_operation()
         self._install_result = None
+        self._update_recent_install_status(
+            installed=False,
+            can_rollback=False,
+        )
         self.completion_page.show_result(
             CompletionPageViewModel.rolled_back(result)
         )
@@ -1692,6 +2383,69 @@ class MainWindow(QMainWindow):
         self._show_page(self.completion_page)
         self.footer_status.setText(status)
 
+    def _restore_install_history(self, modpack_dir: Path) -> None:
+        try:
+            recovered = recover_latest_install_result(modpack_dir)
+        except (OSError, RuntimeError, ValueError):
+            recovered = None
+        self._install_result = recovered
+        if recovered is not None:
+            self._build_unlocked = True
+            self.completion_page.show_result(
+                CompletionPageViewModel.installed(recovered)
+            )
+        self._refresh_step_navigation()
+
+    def _update_recent_install_status(
+        self,
+        *,
+        installed: bool,
+        can_rollback: bool,
+    ) -> None:
+        inspection = self.current_inspection
+        if inspection is None:
+            return
+        try:
+            self._recent_projects = (
+                self._recent_projects_store.update_progress(
+                    inspection.input_directory,
+                    current_stage=self.stage.value,
+                    last_page=self.session.current_page,
+                    installed=installed,
+                    can_rollback=can_rollback,
+                )
+            )
+        except OSError:
+            self.footer_status.setText(
+                "文件操作已完成，但最近项目状态未能保存"
+            )
+            return
+        self.home_page.show_projects(
+            self._recent_projects.projects,
+            self._discovered_projects,
+        )
+
+    def _confirm_install_plan(
+        self,
+        result: BuildWorkflowResult,
+    ) -> bool:
+        message = QMessageBox(self)
+        message.setWindowTitle("确认安装汉化包")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText("即将把汉化文件安装到当前整合包")
+        message.setInformativeText(
+            f"新增 {result.new_files:,} 个文件，覆盖 "
+            f"{result.overwrite_files:,} 个文件。\n"
+            "被覆盖文件将备份到 .mc-han/backups/<安装时间>。\n"
+            "mods/*.jar 始终只读，不会被修改。"
+        )
+        message.setStandardButtons(
+            QMessageBox.StandardButton.Cancel
+            | QMessageBox.StandardButton.Yes
+        )
+        message.setDefaultButton(QMessageBox.StandardButton.Yes)
+        return message.exec() == QMessageBox.StandardButton.Yes
+
     def _can_use_build_result(self) -> bool:
         return (
             not self._task_running()
@@ -1721,10 +2475,77 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(
             self,
             "选择 Minecraft 整合包目录",
-            "",
+            str(self._last_directory or ""),
             QFileDialog.Option.ShowDirsOnly,
         )
         return selected or None
+
+    def _refresh_home_projects(self) -> None:
+        self._recent_projects = self._recent_projects_store.load()
+        self._last_directory = self._recent_projects.last_directory
+        manual_paths = tuple(
+            project.path for project in self._recent_projects.projects
+        )
+        try:
+            self._discovered_projects = self._project_discovery_service(
+                manual_paths
+            )
+        except (OSError, RuntimeError, ValueError):
+            self._discovered_projects = ()
+        if hasattr(self, "home_page"):
+            self.home_page.show_projects(
+                self._recent_projects.projects,
+                self._discovered_projects,
+            )
+
+    def _remember_inspection(self, inspection: ModpackInspection) -> None:
+        previous = self._recent_projects_store.find(
+            inspection.input_directory
+        )
+        project = RecentProject.from_inspection(
+            inspection,
+            current_stage=self.stage.value,
+            last_page=self.session.current_page,
+            previous=previous,
+        )
+        project = replace(
+            project,
+            installed=self._install_result is not None,
+            can_rollback=self._install_result is not None,
+        )
+        try:
+            self._recent_projects = self._recent_projects_store.upsert(
+                project,
+                last_directory=inspection.input_directory,
+            )
+        except OSError:
+            self.footer_status.setText(
+                "检测完成，但最近项目未能保存"
+            )
+            return
+        self._last_directory = inspection.input_directory
+        self.home_page.show_projects(
+            self._recent_projects.projects,
+            self._discovered_projects,
+        )
+
+    @Slot()
+    def _persist_project_progress(self) -> None:
+        inspection = self.current_inspection
+        if inspection is None:
+            return
+        try:
+            self._recent_projects = (
+                self._recent_projects_store.update_progress(
+                    inspection.input_directory,
+                    current_stage=self.stage.value,
+                    last_page=self.session.current_page,
+                )
+            )
+        except OSError:
+            self.footer_status.setText(
+                "当前流程可继续，但项目进度未能保存"
+            )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._task_running():
@@ -1756,6 +2577,8 @@ class MainWindow(QMainWindow):
             return
         self._close_when_idle = False
         self._close_scheduled = False
+        if self._owns_theme_manager:
+            self.theme_manager.dispose()
         super().closeEvent(event)
 
     def _disable_task_starters_for_pending_close(self) -> None:
@@ -1764,6 +2587,9 @@ class MainWindow(QMainWindow):
         self.inspection_page.start_scan_button.setEnabled(False)
         self.scan_page.rescan_button.setEnabled(False)
         self.scan_page.continue_button.setEnabled(False)
+        self.translation_plan_page.back_button.setEnabled(False)
+        self.translation_plan_page.advanced_button.setEnabled(False)
+        self.translation_plan_page.continue_button.setEnabled(False)
         self.translation_config_page.back_button.setEnabled(False)
         self.translation_config_page.validate_button.setEnabled(False)
         self.translation_config_page.continue_button.setEnabled(False)
@@ -1859,12 +2685,54 @@ class MainWindow(QMainWindow):
         self._full_translated_before_run = 0
         self._full_elapsed_previous = 0.0
         self._full_started_at = 0.0
+        self._full_usage = TranslationUsageSummary()
+        self._full_activity = []
+        self._full_budget_warning_emitted = False
+        self._full_last_progress = None
 
     def _clear_build_state(self) -> None:
         self._build_running = False
         self._build_result = None
         self._install_result = None
         self._export_result = None
+
+
+def _saved_plan_mode(settings: UserSettings) -> TranslationPlanMode:
+    try:
+        return TranslationPlanMode(
+            settings.plan_mode or TranslationPlanMode.BALANCED.value
+        )
+    except ValueError:
+        return TranslationPlanMode.BALANCED
+
+
+def _saved_theme_preference(settings: UserSettings) -> ThemePreference:
+    try:
+        return ThemePreference(
+            settings.theme_mode or ThemePreference.SYSTEM.value
+        )
+    except ValueError:
+        return ThemePreference.SYSTEM
+
+
+def _saved_budget(settings: UserSettings) -> Decimal | None:
+    if not settings.budget_limit_usd:
+        return None
+    try:
+        budget = Decimal(settings.budget_limit_usd)
+    except (InvalidOperation, ValueError):
+        return None
+    return budget if budget > 0 else None
+
+
+def _scope_label(scope: TranslationRuleScope) -> str:
+    return {
+        TranslationRuleScope.RECORD: "当前文本",
+        TranslationRuleScope.FILE: "当前文件",
+        TranslationRuleScope.MOD: "当前模组",
+        TranslationRuleScope.PROJECT: "当前项目",
+        TranslationRuleScope.GLOBAL: "全局相似内容",
+    }[scope]
 
 
 def run_qt_app(
@@ -1881,18 +2749,39 @@ def run_qt_app(
         application = QApplication(list(argv) if argv is not None else sys.argv)
     application.setApplicationName("mc-han")
     application.setOrganizationName("mc-han")
-    window = MainWindow()
+    if smoke_test:
+        window = MainWindow(
+            recent_projects_store=MemoryRecentProjectsStore(),
+            project_discovery_service=lambda _manual_paths: (),
+            credential_store=MemoryCredentialStore(),
+        )
+    else:
+        window = MainWindow(
+            recent_projects_store=RecentProjectsStore(),
+            project_discovery_service=(
+                lambda manual_paths: discover_modpacks(
+                    manual_paths=manual_paths
+                )
+            ),
+            credential_store=CredentialStore(),
+            settings_path=config_path(),
+        )
     window.show()
     if not owns_application:
         return 0
 
-    smoke_state = {"completed": not smoke_test, "valid": not smoke_test}
+    smoke_state = {
+        "completed": not smoke_test,
+        "valid": not smoke_test,
+        "failure_code": 0,
+    }
     if smoke_test:
         def complete_smoke_test() -> None:
             pages = (
                 window.home_page,
                 window.inspection_page,
                 window.scan_page,
+                window.translation_plan_page,
                 window.translation_config_page,
                 window.trial_translation_page,
                 window.full_translation_page,
@@ -1910,13 +2799,18 @@ def run_qt_app(
             window.pages.setCurrentWidget(window.home_page)
             application.processEvents()
             smoke_state["completed"] = True
-            smoke_state["valid"] = (
-                window.isVisible()
-                and window.home_page.select_button.isEnabled()
-                and window.pages.currentWidget() is window.home_page
-                and pages_switchable
-                and get_version() != UNKNOWN_VERSION
+            checks = (
+                (window.windowHandle() is not None, 3),
+                (window.home_page.select_button.isEnabled(), 4),
+                (window.pages.currentWidget() is window.home_page, 5),
+                (pages_switchable, 6),
+                (get_version() != UNKNOWN_VERSION, 7),
             )
+            smoke_state["failure_code"] = next(
+                (code for valid, code in checks if not valid),
+                0,
+            )
+            smoke_state["valid"] = smoke_state["failure_code"] == 0
             window.close()
             application.quit()
 
@@ -1924,5 +2818,5 @@ def run_qt_app(
 
     exit_code = application.exec()
     if smoke_test and (not smoke_state["completed"] or not smoke_state["valid"]):
-        return 1
+        return int(smoke_state["failure_code"] or 2)
     return exit_code

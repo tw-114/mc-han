@@ -15,6 +15,13 @@ from mc_han.extractors.lang_json import extract_lang_json
 from mc_han.models import ExtractedText, make_record
 from mc_han.utils.encoding import decode_text
 from mc_han.utils.paths import relative_posix
+from mc_han.workflow.provenance import (
+    ExistingTranslationCandidate,
+    TranslationSource,
+    original_text_hash,
+    record_artifact_version,
+    record_mod_id,
+)
 
 KEY_VALUE_RE = re.compile(r"^\s*(?P<key>[^#:=\s][^:=]*?)\s*[:=]\s*(?P<value>.*?)\s*$")
 SNBT_STRING_PAIR_RE = re.compile(
@@ -28,14 +35,27 @@ SNBT_DESCRIPTION_START_RE = re.compile(r"description\s*:\s*\[")
 SNBT_STRING_RE = re.compile(r'"(?P<value>(?:\\.|[^"\\])*)"')
 
 
-def scan_ftbquests(modpack_dir: Path) -> list[ExtractedText]:
+def scan_ftbquests(
+    modpack_dir: Path,
+    *,
+    provenance_candidates: list[ExistingTranslationCandidate] | None = None,
+) -> list[ExtractedText]:
     records: list[ExtractedText] = []
-    records.extend(scan_ftbquests_lang(modpack_dir))
+    records.extend(
+        scan_ftbquests_lang(
+            modpack_dir,
+            provenance_candidates=provenance_candidates,
+        )
+    )
     records.extend(scan_ftbquests_snbt(modpack_dir))
     return records
 
 
-def scan_ftbquests_lang(modpack_dir: Path) -> list[ExtractedText]:
+def scan_ftbquests_lang(
+    modpack_dir: Path,
+    *,
+    provenance_candidates: list[ExistingTranslationCandidate] | None = None,
+) -> list[ExtractedText]:
     lang_root = modpack_dir / "config" / "ftbquests" / "quests" / "lang"
     if not lang_root.exists():
         return []
@@ -45,7 +65,17 @@ def scan_ftbquests_lang(modpack_dir: Path) -> list[ExtractedText]:
     for path in paths:
         rel_path = relative_posix(path, modpack_dir)
         content = decode_text(path.read_bytes())
-        records.extend(extract_ftbquests_lang_file(content, file_path=rel_path))
+        extracted = extract_ftbquests_lang_file(content, file_path=rel_path)
+        records.extend(extracted)
+        if provenance_candidates is not None:
+            provenance_candidates.extend(
+                _paired_ftbquests_candidates(
+                    path,
+                    lang_root=lang_root,
+                    modpack_dir=modpack_dir,
+                    records=extracted,
+                )
+            )
     return records
 
 
@@ -261,6 +291,95 @@ def extract_snbt_pairs(content: str, *, file_path: str) -> list[ExtractedText]:
             )
         )
     return records
+
+
+def _paired_ftbquests_candidates(
+    en_path: Path,
+    *,
+    lang_root: Path,
+    modpack_dir: Path,
+    records: list[ExtractedText],
+) -> tuple[ExistingTranslationCandidate, ...]:
+    zh_path = _ftbquests_zh_path(en_path, lang_root)
+    if zh_path is None or not zh_path.is_file():
+        return ()
+    try:
+        content = decode_text(zh_path.read_bytes())
+        translations = _ftbquests_translation_map(content, zh_path)
+    except (OSError, UnicodeError, ValueError):
+        return ()
+    source_location = relative_posix(zh_path, modpack_dir)
+    candidates: list[ExistingTranslationCandidate] = []
+    for record in records:
+        translation = translations.get(record.key_path)
+        if not translation:
+            continue
+        candidates.append(
+            ExistingTranslationCandidate(
+                record_id=record.id,
+                source=TranslationSource.MODPACK_AUTHOR,
+                translation=translation,
+                mod_id=record_mod_id(record),
+                key_path=record.key_path,
+                original_hash=original_text_hash(record.original),
+                artifact_version=record_artifact_version(record),
+                source_location=source_location,
+            )
+        )
+    return tuple(candidates)
+
+
+def _ftbquests_zh_path(en_path: Path, lang_root: Path) -> Path | None:
+    try:
+        relative = en_path.relative_to(lang_root)
+    except ValueError:
+        return None
+    parts = list(relative.parts)
+    if not parts:
+        return None
+    first = parts[0]
+    if first == "en_us":
+        parts[0] = "zh_cn"
+    elif first.startswith("en_us."):
+        parts[0] = f"zh_cn{first[len('en_us'):]}"
+    else:
+        return None
+    return lang_root.joinpath(*parts)
+
+
+def _ftbquests_translation_map(content: str, path: Path) -> dict[str, str]:
+    stripped = content.lstrip()
+    if path.suffix.casefold() == ".json" or stripped.startswith("{"):
+        raw = json.loads(content)
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in raw.items()
+            if isinstance(key, str)
+            and isinstance(value, str)
+            and value.strip()
+        }
+    if path.suffix.casefold() == ".snbt":
+        return {
+            strip_wrapping_quotes(match.group("key")): decode_escaped_string(
+                match.group("value")
+            )
+            for match in SNBT_STRING_PAIR_RE.finditer(content)
+            if decode_escaped_string(match.group("value")).strip()
+        }
+    translations: dict[str, str] = {}
+    for line in content.splitlines():
+        match = KEY_VALUE_RE.match(line)
+        if match is None:
+            continue
+        key = strip_wrapping_quotes(match.group("key").strip())
+        value = strip_wrapping_quotes(
+            match.group("value").rstrip(",").strip()
+        )
+        if value:
+            translations[key] = value
+    return translations
 
 
 def _newline_offsets(content: str) -> tuple[int, ...]:

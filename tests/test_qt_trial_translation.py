@@ -13,8 +13,11 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QLabel
 
+from mc_han.core.project import project_paths
+from mc_han.csv_store import read_extracted_csv, write_extracted_csv
 from mc_han.models import ExtractedText
 from mc_han.qt.main_window import MainWindow
+from mc_han.qt.trial_view_models import TrialPageViewModel
 from mc_han.qt.translation_config_view_models import (
     TranslationProvider,
     TranslationSessionConfig,
@@ -304,4 +307,44 @@ def test_trial_provider_runs_off_main_thread_and_keeps_ui_responsive(
     release.set()
     _process_until(application, lambda: window.trial_result is not None)
     assert window.trial_translation_page.back_button.isEnabled()
+    _close_window(application, window)
+
+
+def test_trial_feedback_persists_rule_and_marks_only_sample_for_retry(
+    application: QApplication,
+    tmp_path: Path,
+):
+    window = _window(
+        tmp_path,
+        trial_service=lambda *_args, **_kwargs: None,
+    )
+    records = _records()
+    write_extracted_csv(records, project_paths(tmp_path).extracted_csv)
+    result = _success_result(_samples(), "trial-feedback")
+    window.trial_result = result
+    window.trial_samples = result.samples
+    window.trial_translation_page.show_result(
+        TrialPageViewModel.from_result(result)
+    )
+
+    window.save_trial_feedback(
+        {
+            "text_id": records[0].id,
+            "reason": "terminology",
+            "scope": "mod",
+            "instruction": "ME 网络必须保留英文",
+        }
+    )
+
+    saved = {
+        item.id: item
+        for item in read_extracted_csv(
+            project_paths(tmp_path).extracted_csv
+        )
+    }
+    assert saved[records[0].id].translation == ""
+    assert saved[records[0].id].review_status == "needs_retranslate"
+    assert window.trial_result.failed_ids == frozenset({records[0].id})
+    assert project_paths(tmp_path).translation_rules_json.is_file()
+    assert "当前模组" in window.trial_translation_page.feedback_label.text()
     _close_window(application, window)

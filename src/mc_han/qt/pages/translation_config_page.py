@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QFrame,
@@ -100,6 +101,13 @@ class TranslationConfigPage(QScrollArea):
         self.model_edit.setPlaceholderText("输入服务商提供的模型名称")
         form.addRow("模型", self.model_edit)
 
+        self.high_quality_model_edit = QLineEdit()
+        self.high_quality_model_edit.setObjectName("HighQualityModelEdit")
+        self.high_quality_model_edit.setPlaceholderText(
+            "可选，仅用于明确选择的高质量路由"
+        )
+        form.addRow("高质量模型", self.high_quality_model_edit)
+
         key_row = QHBoxLayout()
         key_row.setSpacing(8)
         self.api_key_edit = QLineEdit()
@@ -114,6 +122,16 @@ class TranslationConfigPage(QScrollArea):
         key_row.addWidget(self.api_key_edit, stretch=1)
         key_row.addWidget(self.toggle_key_button)
         form.addRow("API Key", key_row)
+        self.save_api_key_checkbox = QCheckBox(
+            "使用 Windows 安全凭据存储保存 API Key"
+        )
+        self.credential_status = QLabel(
+            "不勾选时，API Key 仅保留在当前程序会话。"
+        )
+        self.credential_status.setObjectName("MutedLabel")
+        self.credential_status.setWordWrap(True)
+        form.addRow("", self.save_api_key_checkbox)
+        form.addRow("", self.credential_status)
 
         self.concurrency_spin = QSpinBox()
         self.concurrency_spin.setObjectName("ConcurrencySpin")
@@ -180,6 +198,7 @@ class TranslationConfigPage(QScrollArea):
             self.provider_combo.setCurrentIndex(index)
             self.base_url_edit.setText(config.base_url)
             self.model_edit.setText(config.model)
+            self.high_quality_model_edit.setText(config.high_quality_model)
             self.api_key_edit.setText(config.api_key)
             self.concurrency_spin.setValue(config.concurrency)
             self.batch_size_spin.setValue(config.batch_size)
@@ -194,6 +213,7 @@ class TranslationConfigPage(QScrollArea):
             base_url=self.base_url_edit.text(),
             model=self.model_edit.text(),
             api_key=self.api_key_edit.text(),
+            high_quality_model=self.high_quality_model_edit.text(),
             concurrency=self.concurrency_spin.value(),
             batch_size=self.batch_size_spin.value(),
             timeout_seconds=self.timeout_spin.value(),
@@ -229,3 +249,6 @@ class TranslationConfigPage(QScrollArea):
             else QLineEdit.EchoMode.Password
         )
         self.toggle_key_button.setText("隐藏" if visible else "显示")
+
+    def show_credential_status(self, message: str) -> None:
+        self.credential_status.setText(message)

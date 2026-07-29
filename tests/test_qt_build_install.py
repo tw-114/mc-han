@@ -20,6 +20,7 @@ from mc_han.services.build_install import (
     BuildWorkflowResult,
     ExportWorkflowResult,
 )
+from mc_han.services.install_history import InstallHistoryStore
 from mc_han.workflow.models import (
     CAPABILITY_ORDER,
     ChineseResourceStatus,
@@ -192,6 +193,7 @@ def test_qt_install_and_rollback_use_existing_manifest_results(
     window = MainWindow(
         install_service=install_service,
         rollback_service=rollback_service,
+        install_confirmation_provider=lambda _result: True,
     )
     window.current_inspection = _inspection(tmp_path)
     window._build_result = _build_result(output_dir)
@@ -214,6 +216,72 @@ def test_qt_install_and_rollback_use_existing_manifest_results(
     )
     assert window.completion_page.title.text() == "本次安装已撤销"
     assert window.completion_page.rollback_button.isHidden()
+    _close(application, window)
+
+
+def test_qt_restores_persistent_rollback_after_reopening_project(
+    application: QApplication,
+    tmp_path: Path,
+):
+    modpack = tmp_path / "pack"
+    backup_dir = modpack / ".mc-han" / "backups" / "one"
+    backup_dir.mkdir(parents=True)
+    target = modpack / "resourcepacks" / "mc-han-cn" / "pack.mcmeta"
+    target.parent.mkdir(parents=True)
+    target.write_text("installed", encoding="utf-8")
+    manifest = backup_dir / "install_manifest.json"
+    manifest.write_text(
+        (
+            '{"version":1,"created_at":"2026-07-29T10:00:00+00:00",'
+            '"items":[{"relative_target":'
+            '"resourcepacks/mc-han-cn/pack.mcmeta",'
+            '"had_backup":false,"backup_relative":""}]}'
+        ),
+        encoding="utf-8",
+    )
+    result = InstallResult(1, 0, backup_dir, manifest)
+    InstallHistoryStore(modpack).record_install(result)
+
+    window = MainWindow()
+    inspection = _inspection(modpack)
+    window.current_inspection = inspection
+    window._restore_install_history(modpack)
+    window._remember_inspection(inspection)
+
+    assert window._install_result is not None
+    assert window._build_unlocked
+    assert not window.completion_page.rollback_button.isHidden()
+    recent = window._recent_projects_store.find(modpack)
+    assert recent is not None
+    assert recent.installed
+    assert recent.can_rollback
+    _close(application, window)
+
+
+def test_install_confirmation_can_cancel_without_starting_task(
+    application: QApplication,
+    tmp_path: Path,
+):
+    output_dir = tmp_path / ".mc-han" / "output"
+    output_dir.mkdir(parents=True)
+    calls: list[str] = []
+
+    window = MainWindow(
+        install_service=lambda **_kwargs: calls.append("install"),
+        install_confirmation_provider=lambda result: (
+            calls.append(f"confirm:{result.new_files}") or False
+        ),
+    )
+    window.current_inspection = _inspection(tmp_path)
+    window._build_result = _build_result(output_dir)
+    window.show_build_install()
+
+    window.build_install_page.install_button.click()
+    application.processEvents()
+
+    assert calls == ["confirm:5"]
+    assert not window._build_running
+    assert "已取消安装" in window.build_install_page.feedback_label.text()
     _close(application, window)
 
 

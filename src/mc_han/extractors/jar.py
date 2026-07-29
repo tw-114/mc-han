@@ -5,6 +5,7 @@ import zipfile
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from time import perf_counter
 
@@ -25,6 +26,12 @@ from mc_han.utils.safe_zip import (
     ZipSafetyLimits,
     bad_zip_diagnostic,
 )
+from mc_han.workflow.provenance import (
+    ExistingTranslationCandidate,
+    TranslationSource,
+    original_text_hash,
+    record_mod_id,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,7 @@ class JarScanResult:
     records: list[ExtractedText]
     supported_entries: Counter[str]
     diagnostics: list[ZipDiagnostic]
+    provenance_candidates: tuple[ExistingTranslationCandidate, ...] = ()
 
 
 JarProgressCallback = Callable[[int, int, str, int], None]
@@ -120,9 +128,13 @@ def inspect_and_scan_jar(
     records: list[ExtractedText] = []
     supported_entries: Counter[str] = Counter()
     diagnostics: list[ZipDiagnostic] = []
+    provenance_candidates: list[ExistingTranslationCandidate] = []
     try:
         with zipfile.ZipFile(jar_path) as jar:
             reader: SafeZipReader[str] = SafeZipReader(jar, limits=limits)
+            artifact_version = _jar_artifact_version(jar, container)
+            language_records: list[ExtractedText] = []
+            zh_cn_by_path: dict[str, dict[str, str]] = {}
 
             def select_candidate(name: str) -> str | None:
                 source_type = classify_jar_entry(name)
@@ -141,18 +153,41 @@ def inspect_and_scan_jar(
                     continue
                 if source_type is None:
                     continue
+                if source_type == "jar_lang_zh_cn":
+                    try:
+                        raw = json.loads(content)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(raw, dict):
+                        zh_cn_by_path[info.filename] = {
+                            str(key): value
+                            for key, value in raw.items()
+                            if isinstance(key, str)
+                            and isinstance(value, str)
+                            and value.strip()
+                        }
+                    continue
                 try:
-                    records.extend(
-                        extract_jar_entry(
-                            content,
-                            source_type,
-                            container,
-                            info.filename,
-                            translate_names=translate_names,
-                        )
+                    extracted = extract_jar_entry(
+                        content,
+                        source_type,
+                        container,
+                        info.filename,
+                        translate_names=translate_names,
                     )
+                    records.extend(extracted)
+                    if source_type == "jar_lang":
+                        language_records.extend(extracted)
                 except json.JSONDecodeError:
                     continue
+            if read_contents:
+                provenance_candidates.extend(
+                    _jar_zh_cn_candidates(
+                        language_records,
+                        zh_cn_by_path=zh_cn_by_path,
+                        artifact_version=artifact_version,
+                    )
+                )
             diagnostics.extend(reader.diagnostics)
     except (zipfile.BadZipFile, zipfile.LargeZipFile) as error:
         diagnostics.append(bad_zip_diagnostic(error))
@@ -169,6 +204,7 @@ def inspect_and_scan_jar(
         records=records,
         supported_entries=supported_entries,
         diagnostics=diagnostics,
+        provenance_candidates=tuple(provenance_candidates),
     )
 
 
@@ -187,6 +223,8 @@ def classify_jar_entry(name: str) -> str | None:
 
     if lower_name.endswith("/lang/en_us.json"):
         return "jar_lang"
+    if lower_name.endswith("/lang/zh_cn.json"):
+        return "jar_lang_zh_cn"
     if lower_name.endswith(".md") and "ae2guide" in lower_parts:
         return "jar_ae2guide"
     if lower_name.endswith(".md") and "guides" in lower_parts:
@@ -246,3 +284,41 @@ def extract_jar_entry(
             file_path=file_path,
         )
     return []
+
+
+def _jar_artifact_version(jar: zipfile.ZipFile, container: str) -> str:
+    digest = sha256()
+    digest.update(PurePosixPath(container).name.encode("utf-8"))
+    for info in sorted(jar.infolist(), key=lambda item: item.filename):
+        digest.update(info.filename.encode("utf-8", errors="surrogatepass"))
+        digest.update(str(info.CRC).encode("ascii"))
+        digest.update(str(info.file_size).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _jar_zh_cn_candidates(
+    records: list[ExtractedText],
+    *,
+    zh_cn_by_path: dict[str, dict[str, str]],
+    artifact_version: str,
+) -> tuple[ExistingTranslationCandidate, ...]:
+    candidates: list[ExistingTranslationCandidate] = []
+    for record in records:
+        en_path = PurePosixPath(record.file_path)
+        zh_path = en_path.with_name("zh_cn.json").as_posix()
+        translation = zh_cn_by_path.get(zh_path, {}).get(record.key_path)
+        if not translation:
+            continue
+        candidates.append(
+            ExistingTranslationCandidate(
+                record_id=record.id,
+                source=TranslationSource.OFFICIAL_ZH_CN,
+                translation=translation,
+                mod_id=record_mod_id(record),
+                key_path=record.key_path,
+                original_hash=original_text_hash(record.original),
+                artifact_version=artifact_version,
+                source_location=zh_path,
+            )
+        )
+    return tuple(candidates)

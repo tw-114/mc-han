@@ -30,6 +30,12 @@ from .utils.safe_zip import (
     DEFAULT_ZIP_LIMITS,
     ZipSafetyLimits,
 )
+from .workflow.provenance import (
+    ExistingTranslationCandidate,
+    SOURCE_PRIORITY,
+    original_text_hash,
+    record_mod_id,
+)
 
 MAX_ZIP_DIAGNOSTICS_IN_REPORT = 50
 
@@ -40,9 +46,11 @@ class ScanRecords(list[ExtractedText]):
         records: list[ExtractedText],
         *,
         inventory: dict[str, object],
+        provenance_candidates: tuple[ExistingTranslationCandidate, ...] = (),
     ) -> None:
         super().__init__(records)
         self.inventory = inventory
+        self.provenance_candidates = tuple(provenance_candidates)
 
 
 @dataclass(frozen=True)
@@ -69,12 +77,18 @@ def scan_modpack(
     jar_results: list[tuple[str, JarScanResult]] = []
     phase_timings: dict[str, float] = {}
     jar_timings: list[tuple[str, float]] = []
+    provenance_candidates: list[ExistingTranslationCandidate] = []
     mods_dir = modpack_dir / "mods"
     total_jars = len(list(mods_dir.glob("*.jar"))) if mods_dir.exists() else 0
 
     _notify_scan_progress(progress, "ftbquests", 0, total_jars, "", len(records))
     started_at = perf_counter()
-    records.extend(scan_ftbquests(modpack_dir))
+    records.extend(
+        scan_ftbquests(
+            modpack_dir,
+            provenance_candidates=provenance_candidates,
+        )
+    )
     phase_timings["ftbquests"] = perf_counter() - started_at
 
     _notify_scan_progress(progress, "filesystem", 0, total_jars, "", len(records))
@@ -83,6 +97,7 @@ def scan_modpack(
         scan_filesystem_lang_sources(
             modpack_dir,
             translate_names=translate_names,
+            provenance_candidates=provenance_candidates,
         )
     )
     phase_timings["filesystem"] = perf_counter() - started_at
@@ -109,6 +124,8 @@ def scan_modpack(
         )
     )
     phase_timings["jars"] = perf_counter() - started_at
+    for _container, result in jar_results:
+        provenance_candidates.extend(result.provenance_candidates)
 
     _notify_scan_progress(
         progress,
@@ -120,7 +137,7 @@ def scan_modpack(
     )
     started_at = perf_counter()
     sorted_records = sorted(
-        records,
+        apply_existing_translation_candidates(records, provenance_candidates),
         key=lambda item: (
             item.source_type,
             item.container,
@@ -136,9 +153,23 @@ def scan_modpack(
     phase_timings["inventory"] = perf_counter() - started_at
     inventory["scan_phase_seconds"] = phase_timings
     inventory["jar_scan_seconds"] = tuple(jar_timings)
+    inventory["existing_chinese_reused_records"] = sum(
+        bool(record.translation.strip()) for record in sorted_records
+    )
     return ScanRecords(
         sorted_records,
         inventory=inventory,
+        provenance_candidates=tuple(
+            sorted(
+                provenance_candidates,
+                key=lambda item: (
+                    item.record_id,
+                    -SOURCE_PRIORITY[item.source],
+                    item.source_location.casefold(),
+                    item.source_location,
+                ),
+            )
+        ),
     )
 
 
@@ -197,8 +228,51 @@ def merge_existing_translations(
             )
         )
     if isinstance(records, ScanRecords):
-        return ScanRecords(merged, inventory=records.inventory)
+        return ScanRecords(
+            merged,
+            inventory=records.inventory,
+            provenance_candidates=records.provenance_candidates,
+        )
     return merged
+
+
+def apply_existing_translation_candidates(
+    records: list[ExtractedText],
+    candidates: list[ExistingTranslationCandidate]
+    | tuple[ExistingTranslationCandidate, ...],
+) -> list[ExtractedText]:
+    by_record: dict[str, list[ExistingTranslationCandidate]] = {}
+    for candidate in candidates:
+        by_record.setdefault(candidate.record_id, []).append(candidate)
+
+    updated: list[ExtractedText] = []
+    for record in records:
+        matching = [
+            candidate
+            for candidate in by_record.get(record.id, ())
+            if candidate.key_path == record.key_path
+            and candidate.mod_id == record_mod_id(record)
+            and candidate.original_hash == original_text_hash(record.original)
+        ]
+        if not matching:
+            updated.append(record)
+            continue
+        selected = max(
+            matching,
+            key=lambda item: (
+                SOURCE_PRIORITY[item.source],
+                item.source_location.casefold(),
+                item.source_location,
+            ),
+        )
+        updated.append(
+            replace(
+                record,
+                translation=selected.translation,
+                note=f"source:{selected.source.value}",
+            )
+        )
+    return updated
 
 
 def translation_reuse_key(record: ExtractedText) -> tuple[str, str, str, str, str]:

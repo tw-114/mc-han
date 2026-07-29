@@ -14,6 +14,11 @@ from mc_han.qt.translation_config_view_models import (
     TranslationSessionConfig,
     create_translator,
 )
+from mc_han.services.translation_rules import (
+    TranslationRuleStore,
+    rule_aware_translator,
+)
+from mc_han.services.provenance import provenance_rule_version
 from mc_han.translator.engine import (
     TranslationItemCompleted,
     TranslationItemFailed,
@@ -37,9 +42,9 @@ from mc_han.workflow.trial_models import (
 )
 
 
-DEFAULT_TRIAL_SAMPLE_COUNT = 10
-MIN_TRIAL_SAMPLE_COUNT = 8
-MAX_TRIAL_SAMPLE_COUNT = 12
+DEFAULT_TRIAL_SAMPLE_COUNT = 8
+MIN_TRIAL_SAMPLE_COUNT = 5
+MAX_TRIAL_SAMPLE_COUNT = 8
 
 TrialProgressCallback = Callable[[TrialProgressEvent], None]
 TranslatorFactory = Callable[[TranslationSessionConfig], object]
@@ -155,6 +160,13 @@ def run_trial_translation(
             "trial_client_invalid",
             "无法创建翻译客户端，请返回检查服务配置。",
         ) from error
+    records_for_rules = read_extracted_csv(paths.extracted_csv)
+    rule_store = TranslationRuleStore(paths.translation_rules_json)
+    translator = rule_aware_translator(
+        translator,
+        records_for_rules,
+        rule_store,
+    )
 
     status_by_id: dict[str, tuple[TrialSampleStatus, bool]] = {}
     completed = 0
@@ -194,7 +206,17 @@ def run_trial_translation(
             sqlite_cache_path=paths.translations_sqlite,
             usage_ledger_path=paths.usage_sqlite,
             usage_task_id=resolved_task_id,
+            provenance_path=paths.provenance_sqlite,
+            rule_version=provenance_rule_version(
+                paths.translation_rules_json
+            ),
             target_ids=set(selected_ids),
+            force_ids={
+                record.id
+                for record in records_for_rules
+                if record.review_status == "needs_retranslate"
+                and record.id in selected_ids
+            },
             worker_count=config.concurrency,
             max_batch_items=config.batch_size,
             continue_on_error=True,

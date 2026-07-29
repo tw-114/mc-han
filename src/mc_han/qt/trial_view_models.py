@@ -21,6 +21,7 @@ class TrialSampleViewModel:
     source: str
     status_text: str
     tone: StatusTone
+    can_feedback: bool
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ def _sample_view_model(sample: TrialSampleResult) -> TrialSampleViewModel:
         source=_safe_relative_location(sample.source),
         status_text=status,
         tone=tone,
+        can_feedback=sample.status is TrialSampleStatus.SUCCESS,
     )
 
 

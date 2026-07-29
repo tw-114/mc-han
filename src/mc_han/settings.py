@@ -7,12 +7,15 @@ from pathlib import Path
 from typing import Any
 
 from mc_han.config import DEFAULT_NAME_TRANSLATION_FORMAT
+from mc_han.utils.atomic_json import write_json_atomic
 
 
 @dataclass(frozen=True)
 class UserSettings:
+    theme_mode: str | None = None
     provider: str | None = None
     model: str | None = None
+    high_quality_model: str | None = None
     api_key: str | None = None
     api_key_env: str | None = None
     base_url: str | None = None
@@ -22,6 +25,9 @@ class UserSettings:
     max_batch_items: int | None = None
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
+    timeout_seconds: int | None = None
+    plan_mode: str | None = None
+    budget_limit_usd: str | None = None
     translate_names: bool | None = None
     name_translation_format: str | None = None
 
@@ -50,9 +56,14 @@ def load_settings(path: Path | None = None) -> UserSettings:
     if not isinstance(raw, dict):
         return UserSettings()
     return UserSettings(
+        theme_mode=clean_theme_mode(raw.get("theme_mode")),
         provider=clean_optional_str(raw.get("provider")),
         model=clean_optional_str(raw.get("model")),
-        api_key=clean_optional_str(raw.get("api_key")),
+        high_quality_model=clean_optional_str(
+            raw.get("high_quality_model")
+        ),
+        # Legacy plaintext API keys are deliberately ignored.
+        api_key=None,
         api_key_env=clean_optional_str(raw.get("api_key_env")),
         base_url=clean_optional_str(raw.get("base_url")),
         limit=clean_optional_int(raw.get("limit")),
@@ -61,6 +72,13 @@ def load_settings(path: Path | None = None) -> UserSettings:
         max_batch_items=clean_optional_int(raw.get("max_batch_items")),
         max_input_tokens=clean_optional_int(raw.get("max_input_tokens")),
         max_output_tokens=clean_optional_int(raw.get("max_output_tokens")),
+        timeout_seconds=clean_bounded_int(
+            raw.get("timeout_seconds"),
+            minimum=1,
+            maximum=600,
+        ),
+        plan_mode=clean_plan_mode(raw.get("plan_mode")),
+        budget_limit_usd=clean_decimal_text(raw.get("budget_limit_usd")),
         translate_names=clean_optional_bool(raw.get("translate_names")),
         name_translation_format=clean_optional_str(raw.get("name_translation_format")),
     )
@@ -69,8 +87,12 @@ def load_settings(path: Path | None = None) -> UserSettings:
 def save_settings(settings: UserSettings, path: Path | None = None) -> Path:
     resolved = path or config_path()
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    data = {key: value for key, value in asdict(settings).items() if value not in (None, "")}
-    resolved.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    data = {
+        key: value
+        for key, value in asdict(settings).items()
+        if key != "api_key" and value not in (None, "")
+    }
+    write_json_atomic(resolved, data)
     try:
         os.chmod(resolved, 0o600)
     except OSError:
@@ -137,6 +159,36 @@ def clean_speed_mode(value: object) -> str | None:
         return None
     normalized = value.strip().lower()
     return normalized if normalized in {"safe", "balanced", "fast"} else None
+
+
+def clean_plan_mode(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return (
+        normalized
+        if normalized in {"economy", "balanced", "high_quality"}
+        else None
+    )
+
+
+def clean_theme_mode(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in {"system", "light", "dark"} else None
+
+
+def clean_decimal_text(value: object) -> str | None:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if parsed < 0 or not parsed < float("inf"):
+        return None
+    return f"{parsed:.2f}"
 
 
 def clean_optional_bool(value: object) -> bool | None:

@@ -29,13 +29,13 @@ def project_version() -> str:
 def test_package_runtime_and_release_names_use_one_version_source():
     expected = project_version()
 
-    assert expected == "0.7.0b1"
+    assert expected == "0.8.0b1"
     assert mc_han.__version__ == expected
     assert get_version() == expected
-    assert release_tag() == "v0.7.0-beta.1"
-    assert windows_archive_name() == "mc-han-windows-x64-v0.7.0-beta.1.zip"
+    assert release_tag() == "v0.8.0-beta.1"
+    assert windows_archive_name() == "mc-han-windows-x64-v0.8.0-beta.1.zip"
     assert windows_checksum_name() == (
-        "mc-han-windows-x64-v0.7.0-beta.1.sha256"
+        "mc-han-windows-x64-v0.8.0-beta.1.sha256"
     )
     assert expected in about_text()
 
@@ -66,6 +66,8 @@ def test_windows_build_script_uses_derived_archive_name_and_audits_output():
     script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 
     assert "windows_archive_name" in script
+    assert "BuildDirectory" in script
+    assert "DistDirectory" in script
     assert '"pytest"' in script
     assert '"--basetemp"' in script
     assert '"compileall", "-q", "src"' in script
@@ -83,9 +85,10 @@ def test_windows_build_script_uses_derived_archive_name_and_audits_output():
 
 def test_release_notes_and_notices_describe_preview_boundary():
     notes = (
-        ROOT / "release-notes" / "v0.7.0-beta.1.md"
+        ROOT / "release-notes" / "v0.8.0-beta.1.md"
     ).read_text(encoding="utf-8")
     notices = (ROOT / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "预览版" in notes
     assert "建议先备份整合包" in notes
@@ -94,3 +97,5 @@ def test_release_notes_and_notices_describe_preview_boundary():
     assert "Shiboken6" in notices
     assert "PyInstaller" in notices
     assert "Qt" in notices
+    assert "v0.8.0-beta.1" in readme
+    assert "mc-han-windows-x64-v0.8.0-beta.1.zip" in readme
