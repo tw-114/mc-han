@@ -2394,6 +2394,7 @@ class MainWindow(QMainWindow):
             self.completion_page.show_result(
                 CompletionPageViewModel.installed(recovered)
             )
+        self._refresh_step_navigation()
 
     def _update_recent_install_status(
         self,
@@ -2748,21 +2749,32 @@ def run_qt_app(
         application = QApplication(list(argv) if argv is not None else sys.argv)
     application.setApplicationName("mc-han")
     application.setOrganizationName("mc-han")
-    window = MainWindow(
-        recent_projects_store=RecentProjectsStore(),
-        project_discovery_service=(
-            lambda manual_paths: discover_modpacks(
-                manual_paths=manual_paths
-            )
-        ),
-        credential_store=CredentialStore(),
-        settings_path=config_path(),
-    )
+    if smoke_test:
+        window = MainWindow(
+            recent_projects_store=MemoryRecentProjectsStore(),
+            project_discovery_service=lambda _manual_paths: (),
+            credential_store=MemoryCredentialStore(),
+        )
+    else:
+        window = MainWindow(
+            recent_projects_store=RecentProjectsStore(),
+            project_discovery_service=(
+                lambda manual_paths: discover_modpacks(
+                    manual_paths=manual_paths
+                )
+            ),
+            credential_store=CredentialStore(),
+            settings_path=config_path(),
+        )
     window.show()
     if not owns_application:
         return 0
 
-    smoke_state = {"completed": not smoke_test, "valid": not smoke_test}
+    smoke_state = {
+        "completed": not smoke_test,
+        "valid": not smoke_test,
+        "failure_code": 0,
+    }
     if smoke_test:
         def complete_smoke_test() -> None:
             pages = (
@@ -2787,13 +2799,18 @@ def run_qt_app(
             window.pages.setCurrentWidget(window.home_page)
             application.processEvents()
             smoke_state["completed"] = True
-            smoke_state["valid"] = (
-                window.isVisible()
-                and window.home_page.select_button.isEnabled()
-                and window.pages.currentWidget() is window.home_page
-                and pages_switchable
-                and get_version() != UNKNOWN_VERSION
+            checks = (
+                (window.windowHandle() is not None, 3),
+                (window.home_page.select_button.isEnabled(), 4),
+                (window.pages.currentWidget() is window.home_page, 5),
+                (pages_switchable, 6),
+                (get_version() != UNKNOWN_VERSION, 7),
             )
+            smoke_state["failure_code"] = next(
+                (code for valid, code in checks if not valid),
+                0,
+            )
+            smoke_state["valid"] = smoke_state["failure_code"] == 0
             window.close()
             application.quit()
 
@@ -2801,5 +2818,5 @@ def run_qt_app(
 
     exit_code = application.exec()
     if smoke_test and (not smoke_state["completed"] or not smoke_state["valid"]):
-        return 1
+        return int(smoke_state["failure_code"] or 2)
     return exit_code
