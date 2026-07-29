@@ -106,6 +106,7 @@ from mc_han.services.build_install import (
     install_localization_package,
     rollback_localization_install,
 )
+from mc_han.services.install_history import recover_latest_install_result
 from mc_han.services.scan_service import scan_and_classify
 from mc_han.services.translation_planning import (
     build_translation_plan_comparison,
@@ -177,6 +178,7 @@ BuildService = Callable[..., BuildWorkflowResult]
 ExportService = Callable[..., ExportWorkflowResult]
 InstallService = Callable[..., InstallResult]
 RollbackService = Callable[..., RollbackResult]
+InstallConfirmationProvider = Callable[[BuildWorkflowResult], bool]
 DirectoryOpener = Callable[[Path], bool]
 CloseDecisionProvider = Callable[[str, bool], CloseDecision]
 ProjectDiscoveryService = Callable[
@@ -222,6 +224,7 @@ class MainWindow(QMainWindow):
         export_service: ExportService = export_localization_zip,
         install_service: InstallService = install_localization_package,
         rollback_service: RollbackService = rollback_localization_install,
+        install_confirmation_provider: InstallConfirmationProvider | None = None,
         directory_opener: DirectoryOpener | None = None,
         directory_picker: DirectoryPicker | None = None,
         close_decision_provider: CloseDecisionProvider | None = None,
@@ -244,6 +247,10 @@ class MainWindow(QMainWindow):
         self._export_service = export_service
         self._install_service = install_service
         self._rollback_service = rollback_service
+        self._install_confirmation_provider = (
+            install_confirmation_provider
+            or self._confirm_install_plan
+        )
         self._directory_opener = directory_opener or self._open_directory
         self._directory_picker = directory_picker or self._choose_directory
         self._close_decision_provider = (
@@ -919,6 +926,7 @@ class MainWindow(QMainWindow):
         self.inspection_page.show_result(
             InspectionPageViewModel.from_inspection(inspection)
         )
+        self._restore_install_history(inspection.input_directory)
         self._remember_inspection(inspection)
         self._close_if_pending()
 
@@ -2244,6 +2252,11 @@ class MainWindow(QMainWindow):
                 or "请先成功生成可安装的资源包。"
             )
             return
+        if not self._install_confirmation_provider(self._build_result):
+            self.build_install_page.show_feedback(
+                "已取消安装，生成结果和现有整合包文件均未改变。"
+            )
+            return
         task = InstallTask(
             modpack_dir=self.current_inspection.input_directory,
             output_dir=self._build_result.output_dir,
@@ -2263,6 +2276,10 @@ class MainWindow(QMainWindow):
     def _install_completed(self, result: InstallResult) -> None:
         self._finish_build_operation()
         self._install_result = result
+        self._update_recent_install_status(
+            installed=True,
+            can_rollback=result.manifest_path is not None,
+        )
         self.completion_page.show_result(
             CompletionPageViewModel.installed(result)
         )
@@ -2301,6 +2318,10 @@ class MainWindow(QMainWindow):
     def _rollback_completed(self, result: RollbackResult) -> None:
         self._finish_build_operation()
         self._install_result = None
+        self._update_recent_install_status(
+            installed=False,
+            can_rollback=False,
+        )
         self.completion_page.show_result(
             CompletionPageViewModel.rolled_back(result)
         )
@@ -2361,6 +2382,68 @@ class MainWindow(QMainWindow):
         self.stage = WorkflowStage.COMPLETION
         self._show_page(self.completion_page)
         self.footer_status.setText(status)
+
+    def _restore_install_history(self, modpack_dir: Path) -> None:
+        try:
+            recovered = recover_latest_install_result(modpack_dir)
+        except (OSError, RuntimeError, ValueError):
+            recovered = None
+        self._install_result = recovered
+        if recovered is not None:
+            self._build_unlocked = True
+            self.completion_page.show_result(
+                CompletionPageViewModel.installed(recovered)
+            )
+
+    def _update_recent_install_status(
+        self,
+        *,
+        installed: bool,
+        can_rollback: bool,
+    ) -> None:
+        inspection = self.current_inspection
+        if inspection is None:
+            return
+        try:
+            self._recent_projects = (
+                self._recent_projects_store.update_progress(
+                    inspection.input_directory,
+                    current_stage=self.stage.value,
+                    last_page=self.session.current_page,
+                    installed=installed,
+                    can_rollback=can_rollback,
+                )
+            )
+        except OSError:
+            self.footer_status.setText(
+                "文件操作已完成，但最近项目状态未能保存"
+            )
+            return
+        self.home_page.show_projects(
+            self._recent_projects.projects,
+            self._discovered_projects,
+        )
+
+    def _confirm_install_plan(
+        self,
+        result: BuildWorkflowResult,
+    ) -> bool:
+        message = QMessageBox(self)
+        message.setWindowTitle("确认安装汉化包")
+        message.setIcon(QMessageBox.Icon.Warning)
+        message.setText("即将把汉化文件安装到当前整合包")
+        message.setInformativeText(
+            f"新增 {result.new_files:,} 个文件，覆盖 "
+            f"{result.overwrite_files:,} 个文件。\n"
+            "被覆盖文件将备份到 .mc-han/backups/<安装时间>。\n"
+            "mods/*.jar 始终只读，不会被修改。"
+        )
+        message.setStandardButtons(
+            QMessageBox.StandardButton.Cancel
+            | QMessageBox.StandardButton.Yes
+        )
+        message.setDefaultButton(QMessageBox.StandardButton.Yes)
+        return message.exec() == QMessageBox.StandardButton.Yes
 
     def _can_use_build_result(self) -> bool:
         return (
@@ -2423,6 +2506,11 @@ class MainWindow(QMainWindow):
             current_stage=self.stage.value,
             last_page=self.session.current_page,
             previous=previous,
+        )
+        project = replace(
+            project,
+            installed=self._install_result is not None,
+            can_rollback=self._install_result is not None,
         )
         try:
             self._recent_projects = self._recent_projects_store.upsert(

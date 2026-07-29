@@ -97,6 +97,7 @@ def _run_e2e(application: QApplication, root: Path) -> None:
         trial_service=trial_service,
         full_translator_factory=lambda _config: _ReleaseFakeProvider(),
         directory_opener=lambda _path: True,
+        install_confirmation_provider=lambda _result: True,
     )
     window.show()
     application.processEvents()

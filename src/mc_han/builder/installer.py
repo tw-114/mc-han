@@ -50,6 +50,8 @@ class InstallResult:
     backed_up_files: int
     backup_dir: Path
     manifest_path: Path | None = None
+    history_saved: bool = True
+    history_warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,8 @@ class RollbackResult:
     removed_files: int
     backup_dir: Path
     manifest_path: Path
+    history_saved: bool = True
+    history_warning: str = ""
 
 
 @dataclass(frozen=True)
