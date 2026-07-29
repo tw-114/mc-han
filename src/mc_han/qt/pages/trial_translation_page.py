@@ -3,9 +3,11 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
+    QComboBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -25,6 +27,8 @@ class TrialTranslationPage(QScrollArea):
     start_requested = Signal()
     retry_requested = Signal()
     continue_requested = Signal()
+    satisfied_requested = Signal(str)
+    feedback_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -117,6 +121,11 @@ class TrialTranslationPage(QScrollArea):
         self.failure_label.setWordWrap(True)
         self.failure_label.hide()
         self.page_layout.addWidget(self.failure_label)
+        self.feedback_label = QLabel("")
+        self.feedback_label.setObjectName("MutedLabel")
+        self.feedback_label.setWordWrap(True)
+        self.feedback_label.hide()
+        self.page_layout.addWidget(self.feedback_label)
 
         actions = QHBoxLayout()
         self.back_button = QPushButton("返回调整配置")
@@ -147,6 +156,7 @@ class TrialTranslationPage(QScrollArea):
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.failure_label.hide()
+        self.feedback_label.hide()
         self._render(view_model)
         self.back_button.setEnabled(True)
         self.start_button.setEnabled(bool(view_model.samples))
@@ -242,4 +252,67 @@ class TrialTranslationPage(QScrollArea):
             card.content_layout.addWidget(original)
             card.content_layout.addWidget(translation)
             card.content_layout.addWidget(source)
+            if sample.can_feedback:
+                feedback_row = QHBoxLayout()
+                satisfied = QPushButton("满意")
+                satisfied.setObjectName(f"Satisfied_{sample.text_id}")
+                reason = QComboBox()
+                reason.setObjectName(f"FeedbackReason_{sample.text_id}")
+                for label, value in (
+                    ("用词不准确", "wording"),
+                    ("语气不合适", "tone"),
+                    ("术语翻错", "terminology"),
+                    ("太像机器翻译", "machine"),
+                    ("自定义要求", "custom"),
+                ):
+                    reason.addItem(label, value)
+                scope = QComboBox()
+                scope.setObjectName(f"FeedbackScope_{sample.text_id}")
+                for label, value in (
+                    ("只处理当前文本", "record"),
+                    ("当前文件", "file"),
+                    ("当前模组", "mod"),
+                    ("当前项目", "project"),
+                    ("全局相似内容", "global"),
+                ):
+                    scope.addItem(label, value)
+                requirement = QLineEdit()
+                requirement.setObjectName(
+                    f"FeedbackRequirement_{sample.text_id}"
+                )
+                requirement.setPlaceholderText("告诉 mc-han 应该怎样修改")
+                submit = QPushButton("保存修改要求")
+                submit.setObjectName(f"FeedbackSubmit_{sample.text_id}")
+                satisfied.clicked.connect(
+                    lambda _checked=False, text_id=sample.text_id:
+                    self.satisfied_requested.emit(text_id)
+                )
+                submit.clicked.connect(
+                    lambda _checked=False,
+                    text_id=sample.text_id,
+                    reason_box=reason,
+                    scope_box=scope,
+                    requirement_edit=requirement:
+                    self.feedback_requested.emit(
+                        {
+                            "text_id": text_id,
+                            "reason": reason_box.currentData(),
+                            "scope": scope_box.currentData(),
+                            "instruction": requirement_edit.text(),
+                        }
+                    )
+                )
+                feedback_row.addWidget(satisfied)
+                feedback_row.addWidget(reason)
+                feedback_row.addWidget(scope)
+                feedback_row.addWidget(requirement, stretch=1)
+                feedback_row.addWidget(submit)
+                card.content_layout.addLayout(feedback_row)
             self.samples_layout.addWidget(card)
+
+    def show_feedback(self, message: str, *, error: bool = False) -> None:
+        self.feedback_label.setText(message)
+        self.feedback_label.setProperty("tone", "error" if error else "success")
+        self.feedback_label.style().unpolish(self.feedback_label)
+        self.feedback_label.style().polish(self.feedback_label)
+        self.feedback_label.show()

@@ -16,6 +16,7 @@ class ProjectPaths:
     translations_sqlite: Path
     usage_sqlite: Path
     translation_cache_jsonl: Path
+    translation_rules_json: Path
     output_dir: Path
     logs_dir: Path
     scan_report: Path
@@ -37,6 +38,7 @@ def project_paths(modpack_dir: Path) -> ProjectPaths:
         translations_sqlite=state_dir / "translations.sqlite",
         usage_sqlite=state_dir / "usage.sqlite3",
         translation_cache_jsonl=state_dir / "translation_cache.jsonl",
+        translation_rules_json=state_dir / "translation_rules.json",
         output_dir=output_dir,
         logs_dir=logs_dir,
         scan_report=logs_dir / "scan_report.txt",

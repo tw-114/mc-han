@@ -133,6 +133,7 @@ def translate_csv(
     max_output_tokens: int | None = None,
     limit: int | None = None,
     force: bool = False,
+    force_ids: set[str] | None = None,
     progress_callback: Callable[[TranslationProgress], None] | None = None,
     sqlite_cache_path: Path | None = None,
     pause_event: Event | None = None,
@@ -209,18 +210,29 @@ def translate_csv(
                 continue
             if target_ids is not None and record.id not in target_ids:
                 continue
-            if record.translation and not force:
+            force_record = force or (
+                force_ids is not None and record.id in force_ids
+            )
+            if record.translation and not force_record:
                 already_translated_rows += 1
                 continue
 
-            cached = sqlite_cache.get(record) if sqlite_cache and not force else None
+            cached = (
+                sqlite_cache.get(record)
+                if sqlite_cache and not force_record
+                else None
+            )
             if cached is None:
-                cached = cache.get(
-                    provider=translator.provider_name,
-                    model=translator.model,
-                    original=record.original,
+                cached = (
+                    cache.get(
+                        provider=translator.provider_name,
+                        model=translator.model,
+                        original=record.original,
+                    )
+                    if not force_record
+                    else None
                 )
-            if cached is not None and not force:
+            if cached is not None and not force_record:
                 updated[index] = replace(record, translation=cached, note="")
                 if sqlite_cache:
                     sqlite_cache.set(
@@ -585,7 +597,21 @@ def translate_csv(
                         translation=translation,
                     )
                     for index, record in group.rows:
-                        updated[index] = replace(record, translation=translation, note="")
+                        clear_review = bool(
+                            force_ids is not None
+                            and record.id in force_ids
+                        )
+                        updated[index] = replace(
+                            record,
+                            translation=translation,
+                            note="",
+                            review_status=(
+                                "" if clear_review else record.review_status
+                            ),
+                            skip_status=(
+                                "" if clear_review else record.skip_status
+                            ),
+                        )
                         emit_event(
                             event_callback,
                             TranslationItemCompleted(

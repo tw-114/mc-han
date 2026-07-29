@@ -106,6 +106,7 @@ from mc_han.services.scan_service import scan_and_classify
 from mc_han.services.translation_planning import (
     build_translation_plan_comparison,
 )
+from mc_han.services.translation_rules import TranslationRuleStore
 from mc_han.services.trial_translation import (
     TrialTranslationError,
     prepare_trial_samples,
@@ -138,11 +139,16 @@ from mc_han.workflow.trial_models import (
     TrialProgressEvent,
     TrialSampleResult,
     TrialTranslationResult,
+    TrialSampleStatus,
 )
 from mc_han.workflow.translation_plan import (
     TranslationPlan,
     TranslationPlanComparison,
     TranslationPlanMode,
+)
+from mc_han.workflow.translation_rules import (
+    TranslationRuleScope,
+    TranslationRuleType,
 )
 
 
@@ -411,6 +417,12 @@ class MainWindow(QMainWindow):
         )
         self.trial_translation_page.continue_requested.connect(
             self.confirm_trial_translation
+        )
+        self.trial_translation_page.satisfied_requested.connect(
+            self.mark_trial_sample_satisfied
+        )
+        self.trial_translation_page.feedback_requested.connect(
+            self.save_trial_feedback
         )
         self.full_translation_page.back_requested.connect(
             self.show_trial_translation_result
@@ -1462,6 +1474,149 @@ class MainWindow(QMainWindow):
         self.footer_status.setText("试译未完成")
         self._close_if_pending()
 
+    @Slot(str)
+    def mark_trial_sample_satisfied(self, text_id: str) -> None:
+        if self.current_inspection is None:
+            return
+        csv_path = project_paths(
+            self.current_inspection.input_directory
+        ).extracted_csv
+        try:
+            update_translation_review_record(
+                csv_path,
+                text_id,
+                ReviewAction.APPROVE,
+            )
+        except (OSError, ValueError):
+            self.trial_translation_page.show_feedback(
+                "未能保存确认状态，译文内容没有被改动。",
+                error=True,
+            )
+            return
+        self.trial_translation_page.show_feedback(
+            "已标记满意，人工确认将优先于后续 AI 与缓存结果。"
+        )
+
+    @Slot(object)
+    def save_trial_feedback(self, payload: object) -> None:
+        if self.current_inspection is None or not isinstance(payload, dict):
+            return
+        text_id = payload.get("text_id")
+        reason = payload.get("reason")
+        scope_value = payload.get("scope")
+        instruction = payload.get("instruction")
+        if not all(
+            isinstance(value, str)
+            for value in (text_id, reason, scope_value, instruction)
+        ):
+            self.trial_translation_page.show_feedback(
+                "修改要求格式无效，请重新填写。",
+                error=True,
+            )
+            return
+        instruction = instruction.strip()
+        if not instruction:
+            self.trial_translation_page.show_feedback(
+                "请先填写希望怎样修改这条译文。",
+                error=True,
+            )
+            return
+        try:
+            scope = TranslationRuleScope(scope_value)
+        except ValueError:
+            self.trial_translation_page.show_feedback(
+                "请选择有效的应用范围。",
+                error=True,
+            )
+            return
+        paths = project_paths(self.current_inspection.input_directory)
+        try:
+            records = read_extracted_csv(paths.extracted_csv)
+            record = next(item for item in records if item.id == text_id)
+        except (OSError, ValueError, StopIteration):
+            self.trial_translation_page.show_feedback(
+                "找不到对应的扫描记录，请重新扫描后再试。",
+                error=True,
+            )
+            return
+        rule_store = self._translation_rule_store(paths.translation_rules_json)
+        rule_type = {
+            "wording": TranslationRuleType.EXACT,
+            "tone": TranslationRuleType.STYLE,
+            "terminology": TranslationRuleType.TERMINOLOGY,
+            "machine": TranslationRuleType.STYLE,
+            "custom": TranslationRuleType.STYLE,
+        }.get(reason, TranslationRuleType.STYLE)
+        try:
+            rule = rule_store.add_feedback_rule(
+                record,
+                rule_type=rule_type,
+                scope=scope,
+                instruction=instruction,
+                source=f"trial_feedback:{reason}",
+            )
+            update_translation_review_record(
+                paths.extracted_csv,
+                text_id,
+                ReviewAction.NEEDS_RETRANSLATE,
+            )
+        except (OSError, ValueError):
+            if "rule" in locals():
+                try:
+                    rule_store.set_enabled(rule.rule_id, False)
+                except (OSError, ValueError):
+                    pass
+            self.trial_translation_page.show_feedback(
+                "修改要求未能完整保存，原译文仍可在检查页处理。",
+                error=True,
+            )
+            return
+        self._mark_trial_sample_for_retry(text_id)
+        resolution = rule_store.resolve(record)
+        conflict_text = (
+            f"；另有 {len(resolution.conflicts)} 条冲突规则未采用"
+            if resolution.conflicts
+            else ""
+        )
+        self.trial_translation_page.show_feedback(
+            f"修改要求已保存到“{_scope_label(scope)}”，"
+            f"该样本已加入重试列表{conflict_text}。"
+        )
+
+    def _mark_trial_sample_for_retry(self, text_id: str) -> None:
+        if self.trial_result is None:
+            return
+        samples = tuple(
+            replace(
+                sample,
+                translation="",
+                status=TrialSampleStatus.FAILED,
+                from_cache=False,
+            )
+            if sample.text_id == text_id
+            else sample
+            for sample in self.trial_result.samples
+        )
+        self.trial_result = replace(self.trial_result, samples=samples)
+        self.trial_samples = samples
+        self.trial_translation_page.show_result(
+            TrialPageViewModel.from_result(self.trial_result)
+        )
+
+    def _translation_rule_store(
+        self,
+        project_path: Path,
+    ) -> TranslationRuleStore:
+        global_path = (
+            self._settings_path.parent / "translation_rules.json"
+            if self._settings_path is not None
+            else None
+        )
+        return TranslationRuleStore(
+            project_path,
+            global_path=global_path,
+        )
+
     @Slot()
     def confirm_trial_translation(self) -> None:
         if self._trial_running or self.trial_result is None:
@@ -2302,6 +2457,16 @@ def _saved_budget(settings: UserSettings) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
     return budget if budget > 0 else None
+
+
+def _scope_label(scope: TranslationRuleScope) -> str:
+    return {
+        TranslationRuleScope.RECORD: "当前文本",
+        TranslationRuleScope.FILE: "当前文件",
+        TranslationRuleScope.MOD: "当前模组",
+        TranslationRuleScope.PROJECT: "当前项目",
+        TranslationRuleScope.GLOBAL: "全局相似内容",
+    }[scope]
 
 
 def run_qt_app(

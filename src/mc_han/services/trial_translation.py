@@ -14,6 +14,8 @@ from mc_han.qt.translation_config_view_models import (
     TranslationSessionConfig,
     create_translator,
 )
+from mc_han.services.translation_rules import TranslationRuleStore
+from mc_han.translator.base import TranslationSegment
 from mc_han.translator.engine import (
     TranslationItemCompleted,
     TranslationItemFailed,
@@ -37,9 +39,9 @@ from mc_han.workflow.trial_models import (
 )
 
 
-DEFAULT_TRIAL_SAMPLE_COUNT = 10
-MIN_TRIAL_SAMPLE_COUNT = 8
-MAX_TRIAL_SAMPLE_COUNT = 12
+DEFAULT_TRIAL_SAMPLE_COUNT = 8
+MIN_TRIAL_SAMPLE_COUNT = 5
+MAX_TRIAL_SAMPLE_COUNT = 8
 
 TrialProgressCallback = Callable[[TrialProgressEvent], None]
 TranslatorFactory = Callable[[TranslationSessionConfig], object]
@@ -155,6 +157,17 @@ def run_trial_translation(
             "trial_client_invalid",
             "无法创建翻译客户端，请返回检查服务配置。",
         ) from error
+    records_for_rules = read_extracted_csv(paths.extracted_csv)
+    records_by_id = {record.id: record for record in records_for_rules}
+    rule_store = TranslationRuleStore(paths.translation_rules_json)
+    translator = _RuleAwareTranslator(
+        translator,
+        lambda segment: (
+            rule_store.resolve(records_by_id[segment.id]).prompt_instructions
+            if segment.id in records_by_id
+            else ()
+        ),
+    )
 
     status_by_id: dict[str, tuple[TrialSampleStatus, bool]] = {}
     completed = 0
@@ -195,6 +208,12 @@ def run_trial_translation(
             usage_ledger_path=paths.usage_sqlite,
             usage_task_id=resolved_task_id,
             target_ids=set(selected_ids),
+            force_ids={
+                record.id
+                for record in records_for_rules
+                if record.review_status == "needs_retranslate"
+                and record.id in selected_ids
+            },
             worker_count=config.concurrency,
             max_batch_items=config.batch_size,
             continue_on_error=True,
@@ -237,6 +256,41 @@ def run_trial_translation(
         elapsed_seconds=elapsed,
         task_id=resolved_task_id,
     )
+
+
+class _RuleAwareTranslator:
+    def __init__(self, translator: object, resolver: Callable[[TranslationSegment], tuple[str, ...]]):
+        self._translator = translator
+        self._resolver = resolver
+        self.provider_name = getattr(translator, "provider_name", "unknown")
+        self.model = getattr(translator, "model", "unknown")
+        self.is_network_provider = bool(
+            getattr(translator, "is_network_provider", False)
+        )
+        self.endpoint_type = getattr(translator, "endpoint_type", "")
+        self.thinking_mode = getattr(translator, "thinking_mode", "")
+
+    def _prepare(
+        self,
+        segments: list[TranslationSegment],
+    ) -> list[TranslationSegment]:
+        return [
+            replace(segment, instructions=self._resolver(segment))
+            for segment in segments
+        ]
+
+    def translate_batch(
+        self,
+        segments: list[TranslationSegment],
+    ) -> list[str]:
+        return self._translator.translate_batch(self._prepare(segments))
+
+    def translate_batch_with_usage(
+        self,
+        segments: list[TranslationSegment],
+    ):
+        method = getattr(self._translator, "translate_batch_with_usage")
+        return method(self._prepare(segments))
 
 
 def _sample_from_record(record: ExtractedText) -> TrialSampleResult:
