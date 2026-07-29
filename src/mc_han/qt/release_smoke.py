@@ -127,6 +127,11 @@ def _run_e2e(application: QApplication, root: Path) -> None:
     _require(window.scan_page.continue_button.isEnabled(), "scan continue")
     window.scan_page.continue_button.click()
     _require(
+        window.stage is WorkflowStage.TRANSLATION_PLAN,
+        "translation plan",
+    )
+    window.translation_plan_page.advanced_button.click()
+    _require(
         window.stage is WorkflowStage.TRANSLATION_CONFIG,
         "translation config",
     )
@@ -148,6 +153,11 @@ def _run_e2e(application: QApplication, root: Path) -> None:
         "config validation",
     )
     window.translation_config_page.continue_button.click()
+    _require(
+        window.stage is WorkflowStage.TRANSLATION_PLAN,
+        "return to translation plan",
+    )
+    window.translation_plan_page.continue_button.click()
     _require(
         window.stage is WorkflowStage.TRIAL_TRANSLATION,
         "trial page",

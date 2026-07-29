@@ -14,6 +14,7 @@ from mc_han.utils.atomic_json import write_json_atomic
 class UserSettings:
     provider: str | None = None
     model: str | None = None
+    high_quality_model: str | None = None
     api_key: str | None = None
     api_key_env: str | None = None
     base_url: str | None = None
@@ -24,6 +25,8 @@ class UserSettings:
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
     timeout_seconds: int | None = None
+    plan_mode: str | None = None
+    budget_limit_usd: str | None = None
     translate_names: bool | None = None
     name_translation_format: str | None = None
 
@@ -54,6 +57,9 @@ def load_settings(path: Path | None = None) -> UserSettings:
     return UserSettings(
         provider=clean_optional_str(raw.get("provider")),
         model=clean_optional_str(raw.get("model")),
+        high_quality_model=clean_optional_str(
+            raw.get("high_quality_model")
+        ),
         # Legacy plaintext API keys are deliberately ignored.
         api_key=None,
         api_key_env=clean_optional_str(raw.get("api_key_env")),
@@ -69,6 +75,8 @@ def load_settings(path: Path | None = None) -> UserSettings:
             minimum=1,
             maximum=600,
         ),
+        plan_mode=clean_plan_mode(raw.get("plan_mode")),
+        budget_limit_usd=clean_decimal_text(raw.get("budget_limit_usd")),
         translate_names=clean_optional_bool(raw.get("translate_names")),
         name_translation_format=clean_optional_str(raw.get("name_translation_format")),
     )
@@ -149,6 +157,29 @@ def clean_speed_mode(value: object) -> str | None:
         return None
     normalized = value.strip().lower()
     return normalized if normalized in {"safe", "balanced", "fast"} else None
+
+
+def clean_plan_mode(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return (
+        normalized
+        if normalized in {"economy", "balanced", "high_quality"}
+        else None
+    )
+
+
+def clean_decimal_text(value: object) -> str | None:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if parsed < 0 or not parsed < float("inf"):
+        return None
+    return f"{parsed:.2f}"
 
 
 def clean_optional_bool(value: object) -> bool | None:

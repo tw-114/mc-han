@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
@@ -41,6 +42,7 @@ from mc_han.qt.pages.inspection_page import InspectionPage
 from mc_han.qt.pages.scan_page import ScanPage
 from mc_han.qt.pages.settings_page import SettingsPage
 from mc_han.qt.pages.translation_config_page import TranslationConfigPage
+from mc_han.qt.pages.translation_plan_page import TranslationPlanPage
 from mc_han.qt.pages.trial_translation_page import TrialTranslationPage
 from mc_han.qt.pages.translation_review_page import TranslationReviewPage
 from mc_han.qt.project_session import (
@@ -72,6 +74,9 @@ from mc_han.qt.translation_config_view_models import (
     with_recommended_values,
     create_translator,
 )
+from mc_han.qt.translation_plan_view_models import (
+    TranslationPlanPageViewModel,
+)
 from mc_han.qt.trial_view_models import TrialPageViewModel
 from mc_han.qt.translation_review_view_models import (
     TranslationReviewPageViewModel,
@@ -98,6 +103,9 @@ from mc_han.services.build_install import (
     rollback_localization_install,
 )
 from mc_han.services.scan_service import scan_and_classify
+from mc_han.services.translation_planning import (
+    build_translation_plan_comparison,
+)
 from mc_han.services.trial_translation import (
     TrialTranslationError,
     prepare_trial_samples,
@@ -131,6 +139,11 @@ from mc_han.workflow.trial_models import (
     TrialSampleResult,
     TrialTranslationResult,
 )
+from mc_han.workflow.translation_plan import (
+    TranslationPlan,
+    TranslationPlanComparison,
+    TranslationPlanMode,
+)
 
 
 DirectoryPicker = Callable[[], str | None]
@@ -152,6 +165,7 @@ ProjectDiscoveryService = Callable[
     [Sequence[Path]],
     tuple[DiscoveredProject, ...],
 ]
+TranslationPlanningService = Callable[..., TranslationPlanComparison]
 
 WORKFLOW_STEP_LABELS = (
     "整合包",
@@ -165,6 +179,7 @@ STAGE_STEP_INDEX = {
     WorkflowStage.INSPECTION_RESULT: 0,
     WorkflowStage.SCANNING: 0,
     WorkflowStage.SCAN_RESULT: 0,
+    WorkflowStage.TRANSLATION_PLAN: 1,
     WorkflowStage.TRANSLATION_CONFIG: 1,
     WorkflowStage.TRIAL_TRANSLATION: 1,
     WorkflowStage.FULL_TRANSLATION: 1,
@@ -196,6 +211,9 @@ class MainWindow(QMainWindow):
         project_discovery_service: ProjectDiscoveryService | None = None,
         credential_store: CredentialStore | None = None,
         settings_path: Path | None = None,
+        translation_planning_service: TranslationPlanningService = (
+            build_translation_plan_comparison
+        ),
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
@@ -221,6 +239,7 @@ class MainWindow(QMainWindow):
         )
         self._credential_store = credential_store or MemoryCredentialStore()
         self._settings_path = Path(settings_path) if settings_path else None
+        self._translation_planning_service = translation_planning_service
         self._saved_settings = (
             load_settings(self._settings_path)
             if self._settings_path is not None
@@ -252,6 +271,11 @@ class MainWindow(QMainWindow):
         self.scan_selection: ScanSelectionState | None = None
         self.translation_config_draft: TranslationSessionConfig | None = None
         self.translation_session_config: TranslationSessionConfig | None = None
+        self.translation_plan_comparison: TranslationPlanComparison | None = None
+        self.selected_translation_plan: TranslationPlan | None = None
+        self._translation_plan_mode = _saved_plan_mode(self._saved_settings)
+        self._budget_limit_usd = _saved_budget(self._saved_settings)
+        self._config_returns_to_plan = False
         self.trial_samples: tuple[TrialSampleResult, ...] = ()
         self.trial_result: TrialTranslationResult | None = None
         self._trial_task_id = ""
@@ -288,6 +312,7 @@ class MainWindow(QMainWindow):
         self.home_page = HomePage()
         self.inspection_page = InspectionPage()
         self.scan_page = ScanPage()
+        self.translation_plan_page = TranslationPlanPage()
         self.translation_config_page = TranslationConfigPage()
         self.trial_translation_page = TrialTranslationPage()
         self.full_translation_page = FullTranslationPage()
@@ -298,6 +323,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.home_page)
         self.pages.addWidget(self.inspection_page)
         self.pages.addWidget(self.scan_page)
+        self.pages.addWidget(self.translation_plan_page)
         self.pages.addWidget(self.translation_config_page)
         self.pages.addWidget(self.trial_translation_page)
         self.pages.addWidget(self.full_translation_page)
@@ -309,6 +335,7 @@ class MainWindow(QMainWindow):
             self.home_page: "home",
             self.inspection_page: "inspection",
             self.scan_page: "scan",
+            self.translation_plan_page: "translation_plan",
             self.translation_config_page: "translation_config",
             self.trial_translation_page: "trial_translation",
             self.full_translation_page: "full_translation",
@@ -334,7 +361,7 @@ class MainWindow(QMainWindow):
         self.inspection_page.scan_requested.connect(self.start_scan)
         self.scan_page.back_requested.connect(self.show_inspection_result)
         self.scan_page.rescan_requested.connect(self.start_scan)
-        self.scan_page.continue_requested.connect(self.show_translation_config)
+        self.scan_page.continue_requested.connect(self.show_translation_plan)
         self.scan_page.select_all_requested.connect(self.select_all_scan_categories)
         self.scan_page.clear_selection_requested.connect(
             self.clear_scan_categories
@@ -343,6 +370,21 @@ class MainWindow(QMainWindow):
             self.restore_scan_category_defaults
         )
         self.scan_page.category_toggled.connect(self.set_scan_category_selected)
+        self.translation_plan_page.back_requested.connect(
+            self.show_scan_result
+        )
+        self.translation_plan_page.advanced_requested.connect(
+            self.show_translation_config_from_plan
+        )
+        self.translation_plan_page.continue_requested.connect(
+            self.confirm_translation_plan
+        )
+        self.translation_plan_page.mode_changed.connect(
+            self.change_translation_plan_mode
+        )
+        self.translation_plan_page.budget_changed.connect(
+            self.change_translation_budget
+        )
         self.translation_config_page.back_requested.connect(
             self.return_to_scan_from_translation_config
         )
@@ -359,7 +401,7 @@ class MainWindow(QMainWindow):
             self.change_translation_provider
         )
         self.trial_translation_page.back_requested.connect(
-            self.show_translation_config
+            self.show_translation_plan
         )
         self.trial_translation_page.start_requested.connect(
             self.start_trial_translation
@@ -625,7 +667,7 @@ class MainWindow(QMainWindow):
             elif self.translation_session_config is not None:
                 self.show_trial_translation_result()
             else:
-                self.show_translation_config()
+                self.show_translation_plan()
             return
         if self._install_result is not None:
             self._show_page(self.completion_page)
@@ -961,6 +1003,121 @@ class MainWindow(QMainWindow):
         self._render_scan_result()
 
     @Slot()
+    def show_translation_plan(self) -> None:
+        if (
+            self.scan_selection is None
+            or self.scan_selection.selected_record_count == 0
+            or self.current_inspection is None
+        ):
+            self._show_action_blocked(
+                "请先扫描并选择至少一个需要翻译的类别。"
+            )
+            return
+        paths = project_paths(self.current_inspection.input_directory)
+        config = (
+            self.translation_config_draft
+            or self.translation_session_config
+            or self._saved_translation_config()
+        )
+        try:
+            records = read_extracted_csv(paths.extracted_csv)
+            comparison = self._translation_planning_service(
+                records,
+                self.scan_selection,
+                provider=config.provider.value,
+                base_model=config.model,
+                high_quality_model=config.high_quality_model,
+                concurrency=config.concurrency,
+                sqlite_cache_path=paths.translations_sqlite,
+                jsonl_cache_path=paths.translation_cache_jsonl,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.translation_plan_comparison = None
+            self.selected_translation_plan = None
+            self.translation_plan_page.show_failure(
+                "扫描清单或翻译缓存暂时无法读取。"
+                f"请返回扫描页面重试（{type(error).__name__}）。"
+            )
+        else:
+            self.translation_plan_comparison = comparison
+            self.selected_translation_plan = comparison.for_mode(
+                self._translation_plan_mode
+            )
+            self.translation_plan_page.set_budget(self._budget_limit_usd)
+            self._render_translation_plan()
+        self._config_returns_to_plan = False
+        self.stage = WorkflowStage.TRANSLATION_PLAN
+        self._show_page(self.translation_plan_page)
+        self.footer_status.setText("比较翻译方案")
+
+    @Slot()
+    def show_translation_config_from_plan(self) -> None:
+        self._config_returns_to_plan = True
+        self.show_translation_config()
+
+    @Slot(object)
+    def change_translation_plan_mode(
+        self,
+        mode: TranslationPlanMode,
+    ) -> None:
+        if (
+            not isinstance(mode, TranslationPlanMode)
+            or self.translation_plan_comparison is None
+        ):
+            return
+        self._translation_plan_mode = mode
+        self.selected_translation_plan = (
+            self.translation_plan_comparison.for_mode(mode)
+        )
+        self._save_plan_preferences()
+        self._render_translation_plan()
+
+    @Slot(object)
+    def change_translation_budget(self, budget: Decimal | None) -> None:
+        if budget is not None and (
+            not isinstance(budget, Decimal) or budget <= 0
+        ):
+            return
+        self._budget_limit_usd = budget
+        self._save_plan_preferences()
+        self._render_translation_plan()
+
+    def _render_translation_plan(self) -> None:
+        if self.selected_translation_plan is None:
+            return
+        self.translation_plan_page.show_plan(
+            TranslationPlanPageViewModel.from_plan(
+                self.selected_translation_plan,
+                self._budget_limit_usd,
+            )
+        )
+
+    @Slot()
+    def confirm_translation_plan(self) -> None:
+        if self.selected_translation_plan is None:
+            self._show_action_blocked("请先生成并选择一个翻译方案。")
+            return
+        if self.selected_translation_plan.exceeds_budget(
+            self._budget_limit_usd
+        ):
+            self._show_action_blocked("预计费用超过预算，请先调整方案或预算。")
+            return
+        config = (
+            self.translation_session_config
+            or self.translation_config_draft
+            or self._saved_translation_config()
+        )
+        if not validate_translation_config(config).valid:
+            self._config_returns_to_plan = True
+            self.show_translation_config()
+            self.translation_config_page.show_validation(
+                validate_translation_config(config)
+            )
+            return
+        self.translation_session_config = config
+        self._prepare_trial_and_show()
+
+    @Slot()
     def show_translation_config(self) -> None:
         if self.scan_selection is None or self.scan_selection.selected_record_count == 0:
             self._show_action_blocked(
@@ -1004,7 +1161,10 @@ class MainWindow(QMainWindow):
         self.translation_config_draft = (
             self.translation_config_page.current_config()
         )
-        self.show_scan_result()
+        if self._config_returns_to_plan:
+            self.show_translation_plan()
+        else:
+            self.show_scan_result()
 
     @Slot(object)
     def change_translation_provider(
@@ -1043,6 +1203,12 @@ class MainWindow(QMainWindow):
             return
         self.translation_session_config = config
         self._save_translation_preferences(config)
+        if self._config_returns_to_plan:
+            self.show_translation_plan()
+            return
+        self._prepare_trial_and_show()
+
+    def _prepare_trial_and_show(self) -> None:
         if self.current_inspection is None or self.scan_selection is None:
             return
         try:
@@ -1087,6 +1253,10 @@ class MainWindow(QMainWindow):
             recommended,
             base_url=base_url,
             model=settings.model or recommended.model,
+            high_quality_model=(
+                settings.high_quality_model
+                or recommended.high_quality_model
+            ),
             api_key=api_key,
             concurrency=settings.worker_count or recommended.concurrency,
             batch_size=settings.max_batch_items or recommended.batch_size,
@@ -1110,13 +1280,21 @@ class MainWindow(QMainWindow):
         self.translation_config_page.show_credential_status(
             credential_message
         )
-        self._saved_settings = UserSettings(
+        self._saved_settings = replace(
+            self._saved_settings,
             provider=config.provider.value,
             model=config.model,
+            high_quality_model=config.high_quality_model,
             base_url=config.base_url,
             worker_count=config.concurrency,
             max_batch_items=config.batch_size,
             timeout_seconds=config.timeout_seconds,
+            plan_mode=self._translation_plan_mode.value,
+            budget_limit_usd=(
+                str(self._budget_limit_usd)
+                if self._budget_limit_usd is not None
+                else None
+            ),
         )
         if self._settings_path is None:
             return
@@ -1128,6 +1306,25 @@ class MainWindow(QMainWindow):
         except OSError:
             self.translation_config_page.show_credential_status(
                 f"{credential_message} 非敏感设置未能保存，但本次会话可继续。"
+            )
+
+    def _save_plan_preferences(self) -> None:
+        self._saved_settings = replace(
+            self._saved_settings,
+            plan_mode=self._translation_plan_mode.value,
+            budget_limit_usd=(
+                str(self._budget_limit_usd)
+                if self._budget_limit_usd is not None
+                else None
+            ),
+        )
+        if self._settings_path is None:
+            return
+        try:
+            save_settings(self._saved_settings, path=self._settings_path)
+        except OSError:
+            self.footer_status.setText(
+                "方案已应用于本次会话，但预算设置未能保存"
             )
 
     def _refresh_credential_status(self) -> None:
@@ -1982,6 +2179,9 @@ class MainWindow(QMainWindow):
         self.inspection_page.start_scan_button.setEnabled(False)
         self.scan_page.rescan_button.setEnabled(False)
         self.scan_page.continue_button.setEnabled(False)
+        self.translation_plan_page.back_button.setEnabled(False)
+        self.translation_plan_page.advanced_button.setEnabled(False)
+        self.translation_plan_page.continue_button.setEnabled(False)
         self.translation_config_page.back_button.setEnabled(False)
         self.translation_config_page.validate_button.setEnabled(False)
         self.translation_config_page.continue_button.setEnabled(False)
@@ -2085,6 +2285,25 @@ class MainWindow(QMainWindow):
         self._export_result = None
 
 
+def _saved_plan_mode(settings: UserSettings) -> TranslationPlanMode:
+    try:
+        return TranslationPlanMode(
+            settings.plan_mode or TranslationPlanMode.BALANCED.value
+        )
+    except ValueError:
+        return TranslationPlanMode.BALANCED
+
+
+def _saved_budget(settings: UserSettings) -> Decimal | None:
+    if not settings.budget_limit_usd:
+        return None
+    try:
+        budget = Decimal(settings.budget_limit_usd)
+    except (InvalidOperation, ValueError):
+        return None
+    return budget if budget > 0 else None
+
+
 def run_qt_app(
     argv: Sequence[str] | None = None,
     *,
@@ -2120,6 +2339,7 @@ def run_qt_app(
                 window.home_page,
                 window.inspection_page,
                 window.scan_page,
+                window.translation_plan_page,
                 window.translation_config_page,
                 window.trial_translation_page,
                 window.full_translation_page,

@@ -20,6 +20,7 @@ class WorkflowStage(str, Enum):
     INSPECTION_RESULT = "inspection_result"
     SCANNING = "scanning"
     SCAN_RESULT = "scan_result"
+    TRANSLATION_PLAN = "translation_plan"
     TRANSLATION_CONFIG = "translation_config"
     TRIAL_TRANSLATION = "trial_translation"
     FULL_TRANSLATION = "full_translation"

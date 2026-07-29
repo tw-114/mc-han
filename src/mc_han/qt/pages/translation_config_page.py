@@ -101,6 +101,13 @@ class TranslationConfigPage(QScrollArea):
         self.model_edit.setPlaceholderText("输入服务商提供的模型名称")
         form.addRow("模型", self.model_edit)
 
+        self.high_quality_model_edit = QLineEdit()
+        self.high_quality_model_edit.setObjectName("HighQualityModelEdit")
+        self.high_quality_model_edit.setPlaceholderText(
+            "可选，仅用于明确选择的高质量路由"
+        )
+        form.addRow("高质量模型", self.high_quality_model_edit)
+
         key_row = QHBoxLayout()
         key_row.setSpacing(8)
         self.api_key_edit = QLineEdit()
@@ -191,6 +198,7 @@ class TranslationConfigPage(QScrollArea):
             self.provider_combo.setCurrentIndex(index)
             self.base_url_edit.setText(config.base_url)
             self.model_edit.setText(config.model)
+            self.high_quality_model_edit.setText(config.high_quality_model)
             self.api_key_edit.setText(config.api_key)
             self.concurrency_spin.setValue(config.concurrency)
             self.batch_size_spin.setValue(config.batch_size)
@@ -205,6 +213,7 @@ class TranslationConfigPage(QScrollArea):
             base_url=self.base_url_edit.text(),
             model=self.model_edit.text(),
             api_key=self.api_key_edit.text(),
+            high_quality_model=self.high_quality_model_edit.text(),
             concurrency=self.concurrency_spin.value(),
             batch_size=self.batch_size_spin.value(),
             timeout_seconds=self.timeout_spin.value(),

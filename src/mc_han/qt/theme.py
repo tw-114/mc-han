@@ -146,7 +146,7 @@ def application_stylesheet() -> str:
         color: #B5BBC5;
         background: transparent;
     }
-    QLineEdit, QComboBox, QSpinBox {
+    QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
         min-height: 36px;
         padding: 0 10px;
         background: #FFFFFF;
@@ -154,10 +154,11 @@ def application_stylesheet() -> str:
         border-radius: 7px;
         selection-background-color: #2F80ED;
     }
-    QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
         border-color: #2F80ED;
     }
-    QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button {
+    QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button,
+    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
         border: 0;
         width: 24px;
     }

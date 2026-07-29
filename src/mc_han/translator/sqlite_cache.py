@@ -54,6 +54,43 @@ class SQLiteTranslationCache:
             ).fetchone()
         return str(row[0]) if row else None
 
+    def get_many(
+        self,
+        records: list[ExtractedText] | tuple[ExtractedText, ...],
+    ) -> dict[str, str]:
+        keys_by_id = {
+            record.id: make_sqlite_cache_key(
+                original=record.original,
+                context_hash=context_hash(record),
+                prompt_version=self.prompt_version,
+                glossary_version=self.glossary_version,
+            )
+            for record in records
+        }
+        translations_by_key: dict[str, str] = {}
+        keys = tuple(dict.fromkeys(keys_by_id.values()))
+        with self._lock:
+            for start in range(0, len(keys), 500):
+                chunk = keys[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self.connection.execute(
+                    (
+                        "SELECT cache_key, translation FROM translations "
+                        "WHERE status = 'translated' "
+                        f"AND cache_key IN ({placeholders})"
+                    ),
+                    chunk,
+                ).fetchall()
+                translations_by_key.update(
+                    (str(key), str(translation))
+                    for key, translation in rows
+                )
+        return {
+            record_id: translations_by_key[key]
+            for record_id, key in keys_by_id.items()
+            if key in translations_by_key
+        }
+
     def set(
         self,
         record: ExtractedText,

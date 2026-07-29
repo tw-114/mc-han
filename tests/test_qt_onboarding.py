@@ -199,7 +199,7 @@ def test_completed_workflow_step_can_return(
 
     window.workflow_step_buttons[1].click()
     application.processEvents()
-    assert window.pages.currentWidget() is window.translation_config_page
+    assert window.pages.currentWidget() is window.translation_plan_page
     assert window.workflow_step_buttons[1].isChecked()
 
     window.workflow_step_buttons[0].click()
