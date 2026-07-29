@@ -191,6 +191,7 @@ class ThemeManager(QObject):
             targets.append(window)
         for target in targets:
             _apply_windows_title_bar(target, self.effective_theme)
+        QTimer.singleShot(0, self._reapply_windows_title_bars)
 
     def dispose(self) -> None:
         self.application.removeEventFilter(self)
@@ -226,6 +227,10 @@ class ThemeManager(QObject):
         self.effective_theme = resolved
         self.apply()
         self.changed.emit(resolved)
+
+    def _reapply_windows_title_bars(self) -> None:
+        for target in self.application.topLevelWidgets():
+            _apply_windows_title_bar(target, self.effective_theme)
 
 
 def active_palette() -> ThemePalette:

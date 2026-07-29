@@ -9,10 +9,11 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from mc_han.qt.main_window import MainWindow
 from mc_han.qt.project_session import TaskKind
+import mc_han.qt.theme as theme_module
 from mc_han.qt.theme import (
     DARK_PALETTE,
     LIGHT_PALETTE,
@@ -120,6 +121,80 @@ def test_switching_theme_during_task_preserves_page_and_task(
     assert window.pages.currentWidget() is window.full_translation_page
     assert load_settings(settings_path).theme_mode == "dark"
     window.workflow_controller.finish_task(worker)
+    window.close()
+    manager.dispose()
+
+
+def test_four_theme_switch_paths_and_restart_persistence(
+    application: QApplication,
+    tmp_path: Path,
+):
+    settings_path = tmp_path / "config.json"
+    system = {"theme": EffectiveTheme.LIGHT}
+    manager = ThemeManager(
+        application,
+        system_detector=lambda: system["theme"],
+    )
+    window = MainWindow(
+        settings_path=settings_path,
+        theme_manager=manager,
+    )
+
+    assert manager.preference is ThemePreference.SYSTEM
+    assert manager.effective_theme is EffectiveTheme.LIGHT
+
+    window.change_theme_preference("dark")
+    assert manager.preference is ThemePreference.DARK
+    assert manager.effective_theme is EffectiveTheme.DARK
+
+    window.change_theme_preference("system")
+    assert manager.preference is ThemePreference.SYSTEM
+    assert manager.effective_theme is EffectiveTheme.LIGHT
+
+    system["theme"] = EffectiveTheme.DARK
+    window.show_settings()
+    assert manager.preference is ThemePreference.SYSTEM
+    assert manager.effective_theme is EffectiveTheme.DARK
+
+    window.change_theme_preference("light")
+    assert manager.preference is ThemePreference.LIGHT
+    assert manager.effective_theme is EffectiveTheme.LIGHT
+
+    window.change_theme_preference("dark")
+    assert manager.preference is ThemePreference.DARK
+    assert manager.effective_theme is EffectiveTheme.DARK
+    assert load_settings(settings_path).theme_mode == "dark"
+
+    window.close()
+    manager.dispose()
+
+    reopened = MainWindow(settings_path=settings_path)
+    assert reopened.theme_manager.preference is ThemePreference.DARK
+    assert reopened.theme_manager.effective_theme is EffectiveTheme.DARK
+    reopened.close()
+
+
+def test_theme_apply_repeats_title_bar_update_after_qt_events(
+    application: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[QWidget] = []
+    monkeypatch.setattr(
+        theme_module,
+        "_apply_windows_title_bar",
+        lambda widget, _theme: calls.append(widget),
+    )
+    manager = ThemeManager(
+        application,
+        system_detector=lambda: EffectiveTheme.LIGHT,
+    )
+    window = QWidget()
+
+    manager.apply(window)
+    assert calls.count(window) == 1
+    application.processEvents()
+    assert calls.count(window) >= 2
+
     window.close()
     manager.dispose()
 

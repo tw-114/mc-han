@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
+import os
 import sys
 import threading
 import time
@@ -16,6 +18,11 @@ from PySide6.QtWidgets import QApplication, QPushButton
 from mc_han.core.project import project_paths
 from mc_han.csv_store import read_extracted_csv
 from mc_han.qt.main_window import MainWindow
+from mc_han.qt.theme import (
+    EffectiveTheme,
+    ThemeManager,
+    ThemePreference,
+)
 from mc_han.qt.translation_config_view_models import (
     TranslationProvider,
     TranslationSessionConfig,
@@ -130,6 +137,11 @@ def _run_e2e(application: QApplication, root: Path) -> None:
     installed_mcmeta.write_bytes(original_mcmeta)
     settings_path = root / "user" / "config.json"
     recent_store = RecentProjectsStore(root / "user" / "projects.json")
+    system_theme = {"value": EffectiveTheme.LIGHT}
+    theme_manager = ThemeManager(
+        application,
+        system_detector=lambda: system_theme["value"],
+    )
     full_provider = _ReleaseFakeProvider(
         fail_once_original="Demo description 9",
         failure_attempts=3,
@@ -161,6 +173,7 @@ def _run_e2e(application: QApplication, root: Path) -> None:
                 evidence=("manifest.json", "mods"),
             ),
         ),
+        theme_manager=theme_manager,
     )
     window.show()
     application.processEvents()
@@ -171,8 +184,57 @@ def _run_e2e(application: QApplication, root: Path) -> None:
     )
     window.settings_button.click()
     _require(window.pages.currentWidget() is window.settings_page, "settings page")
+    _require(
+        theme_manager.preference is ThemePreference.SYSTEM
+        and theme_manager.effective_theme is EffectiveTheme.LIGHT,
+        "system light theme",
+    )
+    _require_windows_title_bar_theme(application, window, dark=False)
+    window.change_theme_preference("dark")
+    application.processEvents()
+    _require(
+        theme_manager.preference is ThemePreference.DARK
+        and theme_manager.effective_theme is EffectiveTheme.DARK,
+        "system to manual dark theme",
+    )
+    _require_windows_title_bar_theme(application, window, dark=True)
+    window.change_theme_preference("system")
+    application.processEvents()
+    _require(
+        theme_manager.preference is ThemePreference.SYSTEM
+        and theme_manager.effective_theme is EffectiveTheme.LIGHT,
+        "manual dark to system light theme",
+    )
+    _require_windows_title_bar_theme(application, window, dark=False)
     window.settings_page.back_button.click()
     _require(window.pages.currentWidget() is window.home_page, "settings return")
+    system_theme["value"] = EffectiveTheme.DARK
+    window.settings_button.click()
+    application.processEvents()
+    _require(
+        theme_manager.preference is ThemePreference.SYSTEM
+        and theme_manager.effective_theme is EffectiveTheme.DARK,
+        "system dark theme refresh",
+    )
+    _require_windows_title_bar_theme(application, window, dark=True)
+    window.change_theme_preference("light")
+    application.processEvents()
+    _require(
+        theme_manager.preference is ThemePreference.LIGHT
+        and theme_manager.effective_theme is EffectiveTheme.LIGHT,
+        "system dark to manual light theme",
+    )
+    _require_windows_title_bar_theme(application, window, dark=False)
+    window.change_theme_preference("dark")
+    application.processEvents()
+    _require(
+        theme_manager.preference is ThemePreference.DARK
+        and theme_manager.effective_theme is EffectiveTheme.DARK,
+        "manual light to manual dark theme",
+    )
+    _require_windows_title_bar_theme(application, window, dark=True)
+    window.settings_page.back_button.click()
+    _require(window.pages.currentWidget() is window.home_page, "theme settings return")
 
     discovered_row = window.home_page.discovered_list.itemAt(0).widget()
     _require(discovered_row is not None, "discovered project row")
@@ -456,6 +518,7 @@ def _run_e2e(application: QApplication, root: Path) -> None:
     )
     window.close()
     application.processEvents()
+    theme_manager.dispose()
 
     window = MainWindow(
         directory_picker=lambda: str(modpack),
@@ -467,6 +530,11 @@ def _run_e2e(application: QApplication, root: Path) -> None:
     )
     window.show()
     application.processEvents()
+    _require(
+        window.theme_manager.preference is ThemePreference.DARK
+        and window.theme_manager.effective_theme is EffectiveTheme.DARK,
+        "manual dark theme restart persistence",
+    )
     _require(
         window.home_page.continue_button.isVisible(),
         "restart recent project",
@@ -563,6 +631,30 @@ def _wait_for(
 def _require(condition: bool, label: str) -> None:
     if not condition:
         raise AssertionError(label)
+
+
+def _require_windows_title_bar_theme(
+    application: QApplication,
+    window: MainWindow,
+    *,
+    dark: bool,
+) -> None:
+    if os.name != "nt" or application.platformName().casefold() != "windows":
+        return
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        application.processEvents()
+        enabled = ctypes.c_int()
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            int(window.winId()),
+            20,
+            ctypes.byref(enabled),
+            ctypes.sizeof(enabled),
+        )
+        if result == 0 and bool(enabled.value) is dark:
+            return
+        QThread.msleep(10)
+    _require(False, "Windows title bar theme")
 
 
 def _sha256(path: Path) -> str:
