@@ -119,6 +119,11 @@ def test_qt_review_edits_filters_statuses_and_opens_build_page(
     page = window.translation_review_page
 
     assert window.stage is WorkflowStage.TRANSLATION_REVIEW
+    assert page.filter_combo.currentData() == ReviewFilterId.ISSUES.value
+    assert [row.text_id for row in page.table_model.rows] == ["failed"]
+    page.filter_combo.setCurrentIndex(
+        page.filter_combo.findData(ReviewFilterId.ALL.value)
+    )
     assert page.table_model.rowCount() == 5
     page.search_input.setText("Patchouli")
     application.processEvents()
@@ -200,6 +205,9 @@ def test_qt_review_save_failure_keeps_editor_and_old_csv(
         [_record("edit", translation="原有译文 %s")],
     )
     page = window.translation_review_page
+    page.filter_combo.setCurrentIndex(
+        page.filter_combo.findData(ReviewFilterId.ALL.value)
+    )
     _select(window, "edit")
     csv_path = project_paths(tmp_path).extracted_csv
     before = csv_path.read_bytes()

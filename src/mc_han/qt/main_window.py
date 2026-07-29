@@ -480,7 +480,7 @@ class MainWindow(QMainWindow):
             self.skip_review_record
         )
         self.translation_review_page.retranslate_placeholder_requested.connect(
-            self.show_retranslate_placeholder
+            self.mark_review_record_for_retranslation
         )
         self.translation_review_page.continue_requested.connect(
             self.show_build_install
@@ -2026,7 +2026,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.translation_review_page.show_review(
-            TranslationReviewPageViewModel.from_data(records, issues)
+            self._translation_review_view_model(records, issues)
         )
 
     @Slot(str, str)
@@ -2058,7 +2058,7 @@ class MainWindow(QMainWindow):
         self._apply_review_action(
             record_id,
             ReviewAction.NEEDS_RETRANSLATE,
-            success_message="已标记为需要重译，本轮不会调用 API。",
+            success_message="已加入重译列表，本轮没有调用 API。",
         )
 
     @Slot(str)
@@ -2097,10 +2097,32 @@ class MainWindow(QMainWindow):
             )
             return
         self.translation_review_page.show_review(
-            TranslationReviewPageViewModel.from_data(records, issues),
+            self._translation_review_view_model(records, issues),
             selected_id=record_id,
         )
         self.translation_review_page.show_feedback(success_message)
+
+    def _translation_review_view_model(
+        self,
+        records,
+        issues,
+    ) -> TranslationReviewPageViewModel:
+        cost = (
+            self._full_usage.reported_cost_total
+            if self._full_usage.reported_cost_total is not None
+            else self._full_usage.estimated_cost
+        )
+        currency = (
+            self._full_usage.reported_cost_currency
+            if self._full_usage.reported_cost_total is not None
+            else self._full_usage.estimated_cost_currency
+        )
+        return TranslationReviewPageViewModel.from_data(
+            records,
+            issues,
+            cost_amount=cost,
+            cost_currency=currency,
+        )
 
     @Slot(str)
     def show_retranslate_placeholder(self, _record_id: str) -> None:

@@ -190,6 +190,10 @@ def _run_e2e(application: QApplication, root: Path) -> None:
     )
 
     review = window.translation_review_page
+    review.filter_combo.setCurrentIndex(
+        review.filter_combo.findData("all")
+    )
+    application.processEvents()
     _require(review.table_model.rowCount() > 0, "review records")
     review.table.selectRow(0)
     application.processEvents()

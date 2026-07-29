@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 
 from mc_han.models import ExtractedText
@@ -14,6 +15,7 @@ from mc_han.workflow.scan_models import (
 
 
 class ReviewFilterId(str, Enum):
+    ISSUES = "issues"
     ALL = "all"
     UNTRANSLATED = "untranslated"
     FAILED = "failed"
@@ -79,12 +81,19 @@ class TranslationReviewPageViewModel:
     skipped_count: int
     error_count: int
     warning_count: int
+    passed_count: int
+    needs_confirmation_count: int
+    unresolved_count: int
+    cost_text: str
 
     @classmethod
     def from_data(
         cls,
         records: tuple[ExtractedText, ...],
         issues: tuple[CheckIssue, ...],
+        *,
+        cost_amount: Decimal | None = None,
+        cost_currency: str = "",
     ) -> "TranslationReviewPageViewModel":
         issues_by_location: dict[str, list[CheckIssue]] = defaultdict(list)
         for issue in issues:
@@ -113,6 +122,35 @@ class TranslationReviewPageViewModel:
             ),
             warning_count=sum(
                 issue.severity == "warning" for issue in issues
+            ),
+            passed_count=sum(
+                bool(row.translation.strip())
+                and not row.has_error
+                and not row.has_warning
+                and row.status is not ReviewRowStatus.SKIPPED
+                for row in rows
+            ),
+            needs_confirmation_count=sum(
+                row.has_warning
+                and row.status is ReviewRowStatus.UNREVIEWED
+                for row in rows
+            ),
+            unresolved_count=sum(
+                (
+                    row.has_error
+                    or row.status in {
+                        ReviewRowStatus.UNTRANSLATED,
+                        ReviewRowStatus.FAILED,
+                        ReviewRowStatus.NEEDS_RETRANSLATE,
+                    }
+                )
+                and row.status is not ReviewRowStatus.REVIEWED
+                for row in rows
+            ),
+            cost_text=(
+                f"{cost_currency or 'USD'} {cost_amount:.4f}"
+                if cost_amount is not None
+                else "暂无费用记录"
             ),
         )
 
@@ -185,6 +223,22 @@ def _matches_filter(
 ) -> bool:
     if filter_id is ReviewFilterId.ALL:
         return True
+    if filter_id is ReviewFilterId.ISSUES:
+        return (
+            row.status not in {
+                ReviewRowStatus.REVIEWED,
+                ReviewRowStatus.SKIPPED,
+            }
+            and (
+                row.has_error
+                or row.has_warning
+                or row.status in {
+                    ReviewRowStatus.UNTRANSLATED,
+                    ReviewRowStatus.FAILED,
+                    ReviewRowStatus.NEEDS_RETRANSLATE,
+                }
+            )
+        )
     if filter_id is ReviewFilterId.UNTRANSLATED:
         return (
             not row.translation.strip()

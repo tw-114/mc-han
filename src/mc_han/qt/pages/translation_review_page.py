@@ -30,6 +30,7 @@ from mc_han.qt.widgets.card import Card
 
 
 FILTER_OPTIONS = (
+    ("异常项", ReviewFilterId.ISSUES),
     ("全部", ReviewFilterId.ALL),
     ("未翻译", ReviewFilterId.UNTRANSLATED),
     ("失败", ReviewFilterId.FAILED),
@@ -141,11 +142,11 @@ class TranslationReviewPage(QScrollArea):
         self.summary_values: dict[str, QLabel] = {}
         for column, (key, label) in enumerate(
             (
-                ("total", "总条目"),
-                ("translated", "已翻译"),
-                ("reviewed", "已审核"),
+                ("passed", "自动检查通过"),
+                ("confirm", "建议人工确认"),
+                ("unresolved", "无法处理"),
                 ("skipped", "已跳过"),
-                ("issues", "检查问题"),
+                ("cost", "本次费用"),
             )
         ):
             name = QLabel(label)
@@ -233,7 +234,7 @@ class TranslationReviewPage(QScrollArea):
         edit_actions.addWidget(self.needs_retranslate_button)
         edit_actions.addWidget(self.skip_button)
         detail.content_layout.addLayout(edit_actions)
-        self.retranslate_button = QPushButton("重新翻译当前项")
+        self.retranslate_button = QPushButton("加入重译列表")
         detail.content_layout.addWidget(self.retranslate_button)
         splitter.addWidget(detail)
         splitter.setSizes((680, 380))
@@ -288,20 +289,19 @@ class TranslationReviewPage(QScrollArea):
         selected_id: str = "",
     ) -> None:
         self._view_model = view_model
-        self.summary_values["total"].setText(f"{view_model.total_count:,}")
-        self.summary_values["translated"].setText(
-            f"{view_model.translated_count:,}"
+        self.summary_values["passed"].setText(
+            f"{view_model.passed_count:,}"
         )
-        self.summary_values["reviewed"].setText(
-            f"{view_model.reviewed_count:,}"
+        self.summary_values["confirm"].setText(
+            f"{view_model.needs_confirmation_count:,}"
+        )
+        self.summary_values["unresolved"].setText(
+            f"{view_model.unresolved_count:,}"
         )
         self.summary_values["skipped"].setText(
             f"{view_model.skipped_count:,}"
         )
-        self.summary_values["issues"].setText(
-            f"{view_model.error_count:,} 错误 · "
-            f"{view_model.warning_count:,} 警告"
-        )
+        self.summary_values["cost"].setText(view_model.cost_text)
         self.continue_button.setEnabled(True)
         self.feedback_label.hide()
         self._apply_filter()
