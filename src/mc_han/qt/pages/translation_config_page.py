@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QFrame,
@@ -114,6 +115,16 @@ class TranslationConfigPage(QScrollArea):
         key_row.addWidget(self.api_key_edit, stretch=1)
         key_row.addWidget(self.toggle_key_button)
         form.addRow("API Key", key_row)
+        self.save_api_key_checkbox = QCheckBox(
+            "使用 Windows 安全凭据存储保存 API Key"
+        )
+        self.credential_status = QLabel(
+            "不勾选时，API Key 仅保留在当前程序会话。"
+        )
+        self.credential_status.setObjectName("MutedLabel")
+        self.credential_status.setWordWrap(True)
+        form.addRow("", self.save_api_key_checkbox)
+        form.addRow("", self.credential_status)
 
         self.concurrency_spin = QSpinBox()
         self.concurrency_spin.setObjectName("ConcurrencySpin")
@@ -229,3 +240,6 @@ class TranslationConfigPage(QScrollArea):
             else QLineEdit.EchoMode.Password
         )
         self.toggle_key_button.setText("隐藏" if visible else "显示")
+
+    def show_credential_status(self, message: str) -> None:
+        self.credential_status.setText(message)

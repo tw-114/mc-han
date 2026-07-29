@@ -15,6 +15,7 @@ from mc_han.qt.widgets.card import Card
 
 class SettingsPage(QScrollArea):
     back_requested = Signal()
+    delete_credentials_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -31,7 +32,8 @@ class SettingsPage(QScrollArea):
         title = QLabel("设置")
         title.setObjectName("PageTitle")
         subtitle = QLabel(
-            "翻译服务参数在“配置翻译”步骤中设置，并仅保留在当前程序会话。"
+            "翻译服务和性能参数会保存在本机；API Key 仅通过 Windows "
+            "安全凭据存储保存。"
         )
         subtitle.setObjectName("MutedLabel")
         subtitle.setWordWrap(True)
@@ -49,6 +51,16 @@ class SettingsPage(QScrollArea):
         privacy_text.setWordWrap(True)
         privacy.content_layout.addWidget(privacy_title)
         privacy.content_layout.addWidget(privacy_text)
+        self.credential_status = QLabel("尚未保存 API Key")
+        self.credential_status.setObjectName("MutedLabel")
+        self.credential_status.setWordWrap(True)
+        self.delete_credentials_button = QPushButton("删除已保存的 API Key")
+        self.delete_credentials_button.setEnabled(False)
+        self.delete_credentials_button.clicked.connect(
+            lambda: self.delete_credentials_requested.emit()
+        )
+        privacy.content_layout.addWidget(self.credential_status)
+        privacy.content_layout.addWidget(self.delete_credentials_button)
         layout.addWidget(privacy)
 
         compatibility = Card()
@@ -69,3 +81,15 @@ class SettingsPage(QScrollArea):
         layout.addWidget(self.back_button)
         layout.addStretch()
         self.setWidget(content)
+
+    def show_credential_status(
+        self,
+        message: str,
+        *,
+        can_delete: bool,
+    ) -> None:
+        self.credential_status.setText(message)
+        self.delete_credentials_button.setEnabled(can_delete)
+        self.delete_credentials_button.setToolTip(
+            "" if can_delete else "当前没有已保存的 API Key"
+        )

@@ -79,6 +79,7 @@ from mc_han.qt.translation_review_view_models import (
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
+from mc_han.services.credentials import CredentialStore, MemoryCredentialStore
 from mc_han.services.project_discovery import (
     DiscoveredProject,
     discover_modpacks,
@@ -106,6 +107,12 @@ from mc_han.services.translation_review import (
     ReviewAction,
     load_translation_review,
     update_translation_review_record,
+)
+from mc_han.settings import (
+    UserSettings,
+    config_path,
+    load_settings,
+    save_settings,
 )
 from mc_han.version import UNKNOWN_VERSION, get_version
 from mc_han.workflow.models import ModpackInspection
@@ -191,6 +198,8 @@ class MainWindow(QMainWindow):
         close_decision_provider: CloseDecisionProvider | None = None,
         recent_projects_store: RecentProjectsStore | None = None,
         project_discovery_service: ProjectDiscoveryService | None = None,
+        credential_store: CredentialStore | None = None,
+        settings_path: Path | None = None,
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
@@ -213,6 +222,13 @@ class MainWindow(QMainWindow):
         self._project_discovery_service = (
             project_discovery_service
             or (lambda _manual_paths: ())
+        )
+        self._credential_store = credential_store or MemoryCredentialStore()
+        self._settings_path = Path(settings_path) if settings_path else None
+        self._saved_settings = (
+            load_settings(self._settings_path)
+            if self._settings_path is not None
+            else UserSettings()
         )
         self._recent_projects = self._recent_projects_store.load()
         self._discovered_projects: tuple[DiscoveredProject, ...] = ()
@@ -415,6 +431,9 @@ class MainWindow(QMainWindow):
             self.start_install_rollback
         )
         self.settings_page.back_requested.connect(self.close_settings)
+        self.settings_page.delete_credentials_requested.connect(
+            self.delete_saved_credentials
+        )
         self._refresh_home_projects()
         self.show_home()
 
@@ -631,6 +650,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def show_settings(self) -> None:
+        self._refresh_credential_status()
         self.workflow_controller.open_settings()
         self._show_page(self.settings_page, force=True)
         self.footer_status.setText("设置")
@@ -965,7 +985,7 @@ class MainWindow(QMainWindow):
         config = (
             self.translation_config_draft
             or self.translation_session_config
-            or recommended_translation_config()
+            or self._saved_translation_config()
         )
         self.translation_config_page.show_config(
             TranslationConfigPageViewModel(
@@ -974,6 +994,20 @@ class MainWindow(QMainWindow):
                 selected_category_count=len(
                     self.scan_selection.selected_category_ids
                 ),
+            )
+        )
+        persisted = self._credential_store.contains_persisted(
+            config.provider.value,
+            config.base_url,
+        )
+        self.translation_config_page.save_api_key_checkbox.setChecked(
+            persisted
+        )
+        self.translation_config_page.show_credential_status(
+            (
+                "已从 Windows 安全凭据存储加载 API Key。"
+                if persisted
+                else "不勾选时，API Key 仅保留在当前程序会话。"
             )
         )
         self.stage = WorkflowStage.TRANSLATION_CONFIG
@@ -1023,6 +1057,7 @@ class MainWindow(QMainWindow):
         if not validation.valid:
             return
         self.translation_session_config = config
+        self._save_translation_preferences(config)
         if self.current_inspection is None or self.scan_selection is None:
             return
         try:
@@ -1051,6 +1086,97 @@ class MainWindow(QMainWindow):
         self.stage = WorkflowStage.TRIAL_TRANSLATION
         self._show_page(self.trial_translation_page)
         self.footer_status.setText("等待确认试译")
+
+    def _saved_translation_config(self) -> TranslationSessionConfig:
+        settings = self._saved_settings
+        try:
+            provider = TranslationProvider(
+                settings.provider or TranslationProvider.DEEPSEEK.value
+            )
+        except ValueError:
+            provider = TranslationProvider.DEEPSEEK
+        recommended = recommended_translation_config(provider)
+        base_url = settings.base_url or recommended.base_url
+        api_key = self._credential_store.load(provider.value, base_url) or ""
+        return replace(
+            recommended,
+            base_url=base_url,
+            model=settings.model or recommended.model,
+            api_key=api_key,
+            concurrency=settings.worker_count or recommended.concurrency,
+            batch_size=settings.max_batch_items or recommended.batch_size,
+            timeout_seconds=(
+                settings.timeout_seconds or recommended.timeout_seconds
+            ),
+        )
+
+    def _save_translation_preferences(
+        self,
+        config: TranslationSessionConfig,
+    ) -> None:
+        credential_message = "API Key 仅保留在当前程序会话。"
+        if self.translation_config_page.save_api_key_checkbox.isChecked():
+            result = self._credential_store.save(
+                config.provider.value,
+                config.base_url,
+                config.api_key,
+            )
+            credential_message = result.message
+        self.translation_config_page.show_credential_status(
+            credential_message
+        )
+        self._saved_settings = UserSettings(
+            provider=config.provider.value,
+            model=config.model,
+            base_url=config.base_url,
+            worker_count=config.concurrency,
+            max_batch_items=config.batch_size,
+            timeout_seconds=config.timeout_seconds,
+        )
+        if self._settings_path is None:
+            return
+        try:
+            save_settings(
+                self._saved_settings,
+                path=self._settings_path,
+            )
+        except OSError:
+            self.translation_config_page.show_credential_status(
+                f"{credential_message} 非敏感设置未能保存，但本次会话可继续。"
+            )
+
+    def _refresh_credential_status(self) -> None:
+        descriptors = self._credential_store.descriptors()
+        if descriptors:
+            self.settings_page.show_credential_status(
+                f"已安全保存 {len(descriptors)} 个翻译服务的 API Key。",
+                can_delete=True,
+            )
+        elif self._credential_store.has_session_credentials:
+            self.settings_page.show_credential_status(
+                "API Key 仅保留在当前程序会话，关闭软件后将清除。",
+                can_delete=True,
+            )
+        elif self._credential_store.last_warning:
+            self.settings_page.show_credential_status(
+                self._credential_store.last_warning,
+                can_delete=False,
+            )
+        else:
+            self.settings_page.show_credential_status(
+                "尚未保存 API Key。",
+                can_delete=False,
+            )
+
+    @Slot()
+    def delete_saved_credentials(self) -> None:
+        deleted = self._credential_store.delete_all()
+        self._refresh_credential_status()
+        self.footer_status.setText(
+            "已删除保存的 API Key"
+            if deleted
+            else "当前没有可删除的 API Key"
+        )
 
     @Slot()
     def start_trial_translation(self) -> None:
@@ -1995,6 +2121,8 @@ def run_qt_app(
                 manual_paths=manual_paths
             )
         ),
+        credential_store=CredentialStore(),
+        settings_path=config_path(),
     )
     window.show()
     if not owns_application:

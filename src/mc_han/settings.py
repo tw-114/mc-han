@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from mc_han.config import DEFAULT_NAME_TRANSLATION_FORMAT
+from mc_han.utils.atomic_json import write_json_atomic
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class UserSettings:
     max_batch_items: int | None = None
     max_input_tokens: int | None = None
     max_output_tokens: int | None = None
+    timeout_seconds: int | None = None
     translate_names: bool | None = None
     name_translation_format: str | None = None
 
@@ -52,7 +54,8 @@ def load_settings(path: Path | None = None) -> UserSettings:
     return UserSettings(
         provider=clean_optional_str(raw.get("provider")),
         model=clean_optional_str(raw.get("model")),
-        api_key=clean_optional_str(raw.get("api_key")),
+        # Legacy plaintext API keys are deliberately ignored.
+        api_key=None,
         api_key_env=clean_optional_str(raw.get("api_key_env")),
         base_url=clean_optional_str(raw.get("base_url")),
         limit=clean_optional_int(raw.get("limit")),
@@ -61,6 +64,11 @@ def load_settings(path: Path | None = None) -> UserSettings:
         max_batch_items=clean_optional_int(raw.get("max_batch_items")),
         max_input_tokens=clean_optional_int(raw.get("max_input_tokens")),
         max_output_tokens=clean_optional_int(raw.get("max_output_tokens")),
+        timeout_seconds=clean_bounded_int(
+            raw.get("timeout_seconds"),
+            minimum=1,
+            maximum=600,
+        ),
         translate_names=clean_optional_bool(raw.get("translate_names")),
         name_translation_format=clean_optional_str(raw.get("name_translation_format")),
     )
@@ -69,8 +77,12 @@ def load_settings(path: Path | None = None) -> UserSettings:
 def save_settings(settings: UserSettings, path: Path | None = None) -> Path:
     resolved = path or config_path()
     resolved.parent.mkdir(parents=True, exist_ok=True)
-    data = {key: value for key, value in asdict(settings).items() if value not in (None, "")}
-    resolved.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    data = {
+        key: value
+        for key, value in asdict(settings).items()
+        if key != "api_key" and value not in (None, "")
+    }
+    write_json_atomic(resolved, data)
     try:
         os.chmod(resolved, 0o600)
     except OSError:
