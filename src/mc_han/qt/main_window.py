@@ -64,7 +64,10 @@ from mc_han.qt.task_runner import (
     TaskFailure,
     TrialTranslationTask,
 )
-from mc_han.qt.theme import application_stylesheet
+from mc_han.qt.theme import (
+    ThemeManager,
+    ThemePreference,
+)
 from mc_han.qt.translation_config_view_models import (
     TranslationConfigPageViewModel,
     TranslationProvider,
@@ -220,6 +223,7 @@ class MainWindow(QMainWindow):
         translation_planning_service: TranslationPlanningService = (
             build_translation_plan_comparison
         ),
+        theme_manager: ThemeManager | None = None,
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
@@ -250,6 +254,14 @@ class MainWindow(QMainWindow):
             load_settings(self._settings_path)
             if self._settings_path is not None
             else UserSettings()
+        )
+        application = QApplication.instance()
+        if application is None:
+            raise RuntimeError("QApplication must exist before MainWindow")
+        self._owns_theme_manager = theme_manager is None
+        self.theme_manager = theme_manager or ThemeManager(
+            application,
+            preference=_saved_theme_preference(self._saved_settings),
         )
         self._recent_projects = self._recent_projects_store.load()
         self._discovered_projects: tuple[DiscoveredProject, ...] = ()
@@ -305,7 +317,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("mc-han")
         self.resize(1120, 720)
         self.setMinimumSize(920, 620)
-        self.setStyleSheet(application_stylesheet())
 
         root = QWidget()
         root.setObjectName("AppRoot")
@@ -357,6 +368,7 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.pages, stretch=1)
         root_layout.addWidget(self._build_footer())
         self.setCentralWidget(root)
+        self.theme_manager.apply(self)
 
         self.home_page.select_requested.connect(self.choose_and_inspect)
         self.home_page.project_requested.connect(
@@ -483,6 +495,9 @@ class MainWindow(QMainWindow):
         self.settings_page.back_requested.connect(self.close_settings)
         self.settings_page.delete_credentials_requested.connect(
             self.delete_saved_credentials
+        )
+        self.settings_page.theme_changed.connect(
+            self.change_theme_preference
         )
         self._refresh_home_projects()
         self.show_home()
@@ -689,6 +704,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def show_settings(self) -> None:
+        self.theme_manager.refresh_system_theme()
+        self.settings_page.set_theme(
+            self.theme_manager.preference.value,
+            self.theme_manager.effective_theme.value,
+        )
         self._refresh_credential_status()
         self.workflow_controller.open_settings()
         self._show_page(self.settings_page, force=True)
@@ -701,6 +721,32 @@ class MainWindow(QMainWindow):
         self._show_page(page, force=True)
         self._refresh_step_navigation()
         self.footer_status.setText(self._session_status_text())
+
+    @Slot(object)
+    def change_theme_preference(self, value: object) -> None:
+        try:
+            preference = ThemePreference(str(value))
+        except ValueError:
+            self._show_action_blocked("无法识别所选主题。")
+            return
+        self.theme_manager.set_preference(preference)
+        self._saved_settings = replace(
+            self._saved_settings,
+            theme_mode=preference.value,
+        )
+        self.settings_page.set_theme(
+            preference.value,
+            self.theme_manager.effective_theme.value,
+        )
+        if self._settings_path is not None:
+            try:
+                save_settings(self._saved_settings, path=self._settings_path)
+            except OSError:
+                self.settings_page.theme_status.setText(
+                    "主题已切换，但未能保存到本机设置。"
+                )
+                return
+        self.footer_status.setText("主题已更新")
 
     def _refresh_disabled_reasons(self) -> None:
         if not hasattr(self, "pages"):
@@ -2326,6 +2372,8 @@ class MainWindow(QMainWindow):
             return
         self._close_when_idle = False
         self._close_scheduled = False
+        if self._owns_theme_manager:
+            self.theme_manager.dispose()
         super().closeEvent(event)
 
     def _disable_task_starters_for_pending_close(self) -> None:
@@ -2447,6 +2495,15 @@ def _saved_plan_mode(settings: UserSettings) -> TranslationPlanMode:
         )
     except ValueError:
         return TranslationPlanMode.BALANCED
+
+
+def _saved_theme_preference(settings: UserSettings) -> ThemePreference:
+    try:
+        return ThemePreference(
+            settings.theme_mode or ThemePreference.SYSTEM.value
+        )
+    except ValueError:
+        return ThemePreference.SYSTEM
 
 
 def _saved_budget(settings: UserSettings) -> Decimal | None:

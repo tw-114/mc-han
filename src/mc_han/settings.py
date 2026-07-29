@@ -12,6 +12,7 @@ from mc_han.utils.atomic_json import write_json_atomic
 
 @dataclass(frozen=True)
 class UserSettings:
+    theme_mode: str | None = None
     provider: str | None = None
     model: str | None = None
     high_quality_model: str | None = None
@@ -55,6 +56,7 @@ def load_settings(path: Path | None = None) -> UserSettings:
     if not isinstance(raw, dict):
         return UserSettings()
     return UserSettings(
+        theme_mode=clean_theme_mode(raw.get("theme_mode")),
         provider=clean_optional_str(raw.get("provider")),
         model=clean_optional_str(raw.get("model")),
         high_quality_model=clean_optional_str(
@@ -168,6 +170,13 @@ def clean_plan_mode(value: object) -> str | None:
         if normalized in {"economy", "balanced", "high_quality"}
         else None
     )
+
+
+def clean_theme_mode(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if normalized in {"system", "light", "dark"} else None
 
 
 def clean_decimal_text(value: object) -> str | None:

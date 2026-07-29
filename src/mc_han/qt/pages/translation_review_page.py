@@ -25,6 +25,7 @@ from mc_han.qt.translation_review_view_models import (
     ReviewRowViewModel,
     TranslationReviewPageViewModel,
 )
+from mc_han.qt.theme import active_palette
 from mc_han.qt.widgets.card import Card
 
 
@@ -423,16 +424,17 @@ def _single_line(text: str, limit: int = 120) -> str:
 
 
 def _status_color(status: ReviewRowStatus) -> str:
+    palette = active_palette()
     if status is ReviewRowStatus.REVIEWED:
-        return "#2EAD65"
+        return palette.success
     if status in {
         ReviewRowStatus.FAILED,
         ReviewRowStatus.NEEDS_RETRANSLATE,
     }:
-        return "#D9534F"
+        return palette.error
     if status in {
         ReviewRowStatus.UNTRANSLATED,
         ReviewRowStatus.UNREVIEWED,
     }:
-        return "#B97810"
-    return "#6F7785"
+        return palette.warning
+    return palette.muted
