@@ -11,6 +11,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal, Slot
 
 from mc_han.builder.installer import InstallResult, RollbackResult
 from mc_han.core.project import project_paths
+from mc_han.csv_store import read_extracted_csv
 from mc_han.qt.translation_config_view_models import TranslationSessionConfig
 from mc_han.qt.translation_config_view_models import create_translator
 from mc_han.services.scan_service import ScanServiceError
@@ -23,6 +24,10 @@ from mc_han.services.build_install import (
     rollback_localization_install,
 )
 from mc_han.services.trial_translation import TrialTranslationError
+from mc_han.services.translation_rules import (
+    TranslationRuleStore,
+    rule_aware_translator,
+)
 from mc_han.translator.engine import TranslationProgress, translate_csv
 from mc_han.usage.ledger import UsageLedger
 from mc_han.usage.models import TranslationUsageSummary
@@ -284,7 +289,12 @@ class FullTranslationTask(QRunnable):
         paths = project_paths(self._path)
         started = perf_counter()
         try:
-            translator = self._translator_factory(self._config)
+            source_records = read_extracted_csv(paths.extracted_csv)
+            translator = rule_aware_translator(
+                self._translator_factory(self._config),
+                source_records,
+                TranslationRuleStore(paths.translation_rules_json),
+            )
             records, _translated_count, _cache_hits = translate_csv(
                 input_csv=paths.extracted_csv,
                 output_csv=paths.extracted_csv,
@@ -294,6 +304,12 @@ class FullTranslationTask(QRunnable):
                 usage_ledger_path=paths.usage_sqlite,
                 usage_task_id=self._task_id,
                 target_ids=set(self._target_ids),
+                force_ids={
+                    record.id
+                    for record in source_records
+                    if record.id in self._target_ids
+                    and record.review_status == "needs_retranslate"
+                },
                 worker_count=self._config.concurrency,
                 max_batch_items=self._config.batch_size,
                 pause_event=self._pause_event,

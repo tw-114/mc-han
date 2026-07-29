@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
@@ -136,7 +137,15 @@ from mc_han.workflow.scan_models import (
     ScanProgressEvent,
     ScanSelectionState,
 )
-from mc_han.translator.engine import TranslationProgress, TranslationStarted
+from mc_han.translator.engine import (
+    TranslationBatchCompleted,
+    TranslationItemCompleted,
+    TranslationItemFailed,
+    TranslationProgress,
+    TranslationStarted,
+)
+from mc_han.usage.ledger import UsageLedger
+from mc_han.usage.service import UsageQueryService
 from mc_han.usage.models import TranslationUsageSummary
 from mc_han.workflow.trial_models import (
     TrialProgressEvent,
@@ -306,6 +315,10 @@ class MainWindow(QMainWindow):
         self._full_translated_before_run = 0
         self._full_elapsed_previous = 0.0
         self._full_started_at = 0.0
+        self._full_usage = TranslationUsageSummary()
+        self._full_activity: list[str] = []
+        self._full_budget_warning_emitted = False
+        self._full_last_progress: TranslationProgress | None = None
         self._build_result: BuildWorkflowResult | None = None
         self._install_result: InstallResult | None = None
         self._export_result: ExportWorkflowResult | None = None
@@ -1794,6 +1807,11 @@ class MainWindow(QMainWindow):
         self._full_running = True
         self._refresh_step_navigation()
         self._full_started_at = perf_counter()
+        self._full_usage = self._read_full_usage(paths.usage_sqlite)
+        self._full_activity.append("已开始完整翻译，成功批次会立即保存。")
+        self.full_translation_page.show_activity(
+            tuple(self._full_activity)
+        )
         self.full_translation_page.show_running(
             retry=(
                 self._full_result is not None
@@ -1814,6 +1832,7 @@ class MainWindow(QMainWindow):
     def _full_progress(self, progress: TranslationProgress) -> None:
         if not self._full_running:
             return
+        self._full_last_progress = progress
         self.workflow_controller.update_task_progress(
             f"{progress.completed_rows:,}/{progress.total_rows:,} · "
             f"成功 {progress.translated_rows:,} · 失败 {progress.failed_rows:,}"
@@ -1829,26 +1848,98 @@ class MainWindow(QMainWindow):
                     + perf_counter()
                     - self._full_started_at
                 ),
+                usage=self._full_usage,
+                budget=self._budget_limit_usd,
             )
         )
 
     @Slot(object)
     def _full_translation_event(self, event: object) -> None:
-        if not self._full_running or not isinstance(
-            event,
-            TranslationStarted,
-        ):
+        if not self._full_running:
             return
-        category_id = SOURCE_TYPE_TO_CATEGORY.get(
-            event.source_type,
-            ScanCategoryId.OTHER_SUPPORTED,
+        if isinstance(event, TranslationStarted):
+            category_id = SOURCE_TYPE_TO_CATEGORY.get(
+                event.source_type,
+                ScanCategoryId.OTHER_SUPPORTED,
+            )
+            self._full_current_category = CATEGORY_DEFINITIONS[
+                category_id
+            ].title
+            self.full_translation_page.show_current_category(
+                self._full_current_category
+            )
+            self._append_full_activity(
+                f"正在处理 {self._full_current_category} · "
+                f"{event.file_path or event.text_id}"
+            )
+        elif isinstance(event, TranslationItemCompleted):
+            preview = " ".join(event.translation.split())
+            self._append_full_activity(
+                f"{event.status} · {event.file_path or event.text_id} · "
+                f"{preview[:80]}"
+            )
+        elif isinstance(event, TranslationItemFailed):
+            self._append_full_activity(
+                f"需要处理 · {event.file_path or event.text_id}"
+            )
+        elif isinstance(event, TranslationBatchCompleted):
+            if self.current_inspection is None:
+                return
+            usage_path = project_paths(
+                self.current_inspection.input_directory
+            ).usage_sqlite
+            self._full_usage = self._read_full_usage(usage_path)
+            self._apply_budget_boundary()
+            if self._full_last_progress is not None:
+                self._full_progress(self._full_last_progress)
+
+    def _append_full_activity(self, message: str) -> None:
+        self._full_activity.append(message)
+        del self._full_activity[:-100]
+        self.full_translation_page.show_activity(
+            tuple(self._full_activity)
         )
-        self._full_current_category = CATEGORY_DEFINITIONS[
-            category_id
-        ].title
-        self.full_translation_page.show_current_category(
-            self._full_current_category
+
+    def _read_full_usage(self, path: Path) -> TranslationUsageSummary:
+        if not Path(path).is_file() or not self._full_task_id:
+            return TranslationUsageSummary()
+        try:
+            with UsageLedger(path) as ledger:
+                return UsageQueryService(ledger).task_summary(
+                    self._full_task_id
+                )
+        except (OSError, sqlite3.Error, ValueError):
+            return TranslationUsageSummary()
+
+    def _apply_budget_boundary(self) -> None:
+        budget = self._budget_limit_usd
+        if budget is None or budget <= 0:
+            return
+        amount = (
+            self._full_usage.reported_cost_total
+            if self._full_usage.reported_cost_total is not None
+            else self._full_usage.estimated_cost
         )
+        if amount is None:
+            return
+        if (
+            amount >= budget
+            and self.session.active_task is not None
+            and not self.session.active_task.paused
+        ):
+            if self.workflow_controller.pause_active_task():
+                self.full_translation_page.show_pause_requested()
+                self._append_full_activity(
+                    "已达到预算上限，当前请求完成后已安全暂停。"
+                )
+                self.footer_status.setText("已达到预算上限并安全暂停")
+            return
+        if (
+            not self._full_budget_warning_emitted
+            and amount >= budget * Decimal("0.8")
+        ):
+            self._full_budget_warning_emitted = True
+            self._append_full_activity("费用已达到预算的 80%。")
 
     @Slot(object)
     def _full_completed(
@@ -1861,11 +1952,13 @@ class MainWindow(QMainWindow):
         self._refresh_step_navigation()
         self._full_elapsed_previous += result.elapsed_seconds
         self._full_result = result
+        self._full_usage = result.usage
         self._full_pending_ids = result.remaining_ids
         view_model = FullTranslationPageViewModel.from_result(
             result,
             current_category=self._full_current_category,
             elapsed_seconds=self._full_elapsed_previous,
+            budget=self._budget_limit_usd,
         )
         self.full_translation_page.show_result(view_model)
         self.footer_status.setText("完整翻译任务结束")
@@ -2480,6 +2573,10 @@ class MainWindow(QMainWindow):
         self._full_translated_before_run = 0
         self._full_elapsed_previous = 0.0
         self._full_started_at = 0.0
+        self._full_usage = TranslationUsageSummary()
+        self._full_activity = []
+        self._full_budget_warning_emitted = False
+        self._full_last_progress = None
 
     def _clear_build_state(self) -> None:
         self._build_running = False

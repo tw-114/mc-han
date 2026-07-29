@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
 from mc_han.models import ExtractedText
+from mc_han.translator.base import TranslationSegment
 from mc_han.utils.atomic_json import write_json_atomic
 from mc_han.workflow.translation_rules import (
     TranslationRule,
@@ -94,6 +96,61 @@ class TranslationRuleStore:
         if self.global_path is None:
             return (self.project_path,)
         return (self.project_path, self.global_path)
+
+
+class RuleAwareTranslator:
+    def __init__(
+        self,
+        translator: object,
+        resolver: Callable[[TranslationSegment], tuple[str, ...]],
+    ) -> None:
+        self._translator = translator
+        self._resolver = resolver
+        self.provider_name = getattr(translator, "provider_name", "unknown")
+        self.model = getattr(translator, "model", "unknown")
+        self.is_network_provider = bool(
+            getattr(translator, "is_network_provider", False)
+        )
+        self.endpoint_type = getattr(translator, "endpoint_type", "")
+        self.thinking_mode = getattr(translator, "thinking_mode", "")
+
+    def _prepare(
+        self,
+        segments: list[TranslationSegment],
+    ) -> list[TranslationSegment]:
+        return [
+            replace(segment, instructions=self._resolver(segment))
+            for segment in segments
+        ]
+
+    def translate_batch(
+        self,
+        segments: list[TranslationSegment],
+    ) -> list[str]:
+        return self._translator.translate_batch(self._prepare(segments))
+
+    def translate_batch_with_usage(
+        self,
+        segments: list[TranslationSegment],
+    ):
+        method = getattr(self._translator, "translate_batch_with_usage")
+        return method(self._prepare(segments))
+
+
+def rule_aware_translator(
+    translator: object,
+    records: tuple[ExtractedText, ...] | list[ExtractedText],
+    store: TranslationRuleStore,
+) -> RuleAwareTranslator:
+    records_by_id = {record.id: record for record in records}
+    return RuleAwareTranslator(
+        translator,
+        lambda segment: (
+            store.resolve(records_by_id[segment.id]).prompt_instructions
+            if segment.id in records_by_id
+            else ()
+        ),
+    )
 
 
 def _read_rules(path: Path) -> tuple[TranslationRule, ...]:

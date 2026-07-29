@@ -14,8 +14,10 @@ from mc_han.qt.translation_config_view_models import (
     TranslationSessionConfig,
     create_translator,
 )
-from mc_han.services.translation_rules import TranslationRuleStore
-from mc_han.translator.base import TranslationSegment
+from mc_han.services.translation_rules import (
+    TranslationRuleStore,
+    rule_aware_translator,
+)
 from mc_han.translator.engine import (
     TranslationItemCompleted,
     TranslationItemFailed,
@@ -158,15 +160,11 @@ def run_trial_translation(
             "无法创建翻译客户端，请返回检查服务配置。",
         ) from error
     records_for_rules = read_extracted_csv(paths.extracted_csv)
-    records_by_id = {record.id: record for record in records_for_rules}
     rule_store = TranslationRuleStore(paths.translation_rules_json)
-    translator = _RuleAwareTranslator(
+    translator = rule_aware_translator(
         translator,
-        lambda segment: (
-            rule_store.resolve(records_by_id[segment.id]).prompt_instructions
-            if segment.id in records_by_id
-            else ()
-        ),
+        records_for_rules,
+        rule_store,
     )
 
     status_by_id: dict[str, tuple[TrialSampleStatus, bool]] = {}
@@ -256,41 +254,6 @@ def run_trial_translation(
         elapsed_seconds=elapsed,
         task_id=resolved_task_id,
     )
-
-
-class _RuleAwareTranslator:
-    def __init__(self, translator: object, resolver: Callable[[TranslationSegment], tuple[str, ...]]):
-        self._translator = translator
-        self._resolver = resolver
-        self.provider_name = getattr(translator, "provider_name", "unknown")
-        self.model = getattr(translator, "model", "unknown")
-        self.is_network_provider = bool(
-            getattr(translator, "is_network_provider", False)
-        )
-        self.endpoint_type = getattr(translator, "endpoint_type", "")
-        self.thinking_mode = getattr(translator, "thinking_mode", "")
-
-    def _prepare(
-        self,
-        segments: list[TranslationSegment],
-    ) -> list[TranslationSegment]:
-        return [
-            replace(segment, instructions=self._resolver(segment))
-            for segment in segments
-        ]
-
-    def translate_batch(
-        self,
-        segments: list[TranslationSegment],
-    ) -> list[str]:
-        return self._translator.translate_batch(self._prepare(segments))
-
-    def translate_batch_with_usage(
-        self,
-        segments: list[TranslationSegment],
-    ):
-        method = getattr(self._translator, "translate_batch_with_usage")
-        return method(self._prepare(segments))
 
 
 def _sample_from_record(record: ExtractedText) -> TrialSampleResult:

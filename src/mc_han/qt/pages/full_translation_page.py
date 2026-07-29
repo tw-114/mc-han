@@ -88,6 +88,12 @@ class FullTranslationPage(QScrollArea):
             ("tokens", "总 Token"),
             ("cost", "费用"),
             ("elapsed", "耗时"),
+            ("history_reuse", "历史 / 试译复用"),
+            ("cache_reuse", "缓存复用"),
+            ("api_new", "API 新翻译"),
+            ("remaining", "剩余"),
+            ("eta", "预计剩余"),
+            ("budget", "预算"),
         )
         for index, (key, label) in enumerate(fields):
             row = (index // 4) * 2
@@ -102,6 +108,17 @@ class FullTranslationPage(QScrollArea):
             self.summary_values[key] = value
         summary.content_layout.addLayout(grid)
         layout.addWidget(summary)
+
+        activity = Card()
+        activity_title = QLabel("最近活动")
+        activity_title.setObjectName("CardTitle")
+        self.activity_layout = QVBoxLayout()
+        self.activity_empty = QLabel("开始后显示最近完成的译文和失败项。")
+        self.activity_empty.setObjectName("MutedLabel")
+        self.activity_layout.addWidget(self.activity_empty)
+        activity.content_layout.addWidget(activity_title)
+        activity.content_layout.addLayout(self.activity_layout)
+        layout.addWidget(activity)
 
         self.failure_label = QLabel("")
         self.failure_label.setProperty("tone", "error")
@@ -232,5 +249,27 @@ class FullTranslationPage(QScrollArea):
         self.summary_values["tokens"].setText(view_model.tokens_text)
         self.summary_values["cost"].setText(view_model.cost_text)
         self.summary_values["elapsed"].setText(view_model.elapsed_text)
+        self.summary_values["history_reuse"].setText(
+            view_model.historical_reuse_text
+        )
+        self.summary_values["cache_reuse"].setText(
+            view_model.cache_reuse_text
+        )
+        self.summary_values["api_new"].setText(view_model.api_new_text)
+        self.summary_values["remaining"].setText(view_model.remaining_text)
+        self.summary_values["eta"].setText(view_model.eta_text)
+        self.summary_values["budget"].setText(view_model.budget_text)
         self.progress_bar.setRange(0, max(1, view_model.total_count))
         self.progress_bar.setValue(view_model.completed_count)
+
+    def show_activity(self, messages: tuple[str, ...]) -> None:
+        while self.activity_layout.count():
+            item = self.activity_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for message in messages[-12:]:
+            label = QLabel(message)
+            label.setObjectName("MutedLabel")
+            label.setWordWrap(True)
+            self.activity_layout.addWidget(label)
