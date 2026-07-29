@@ -154,29 +154,25 @@ ProjectDiscoveryService = Callable[
 ]
 
 WORKFLOW_STEP_LABELS = (
-    "选择项目",
-    "扫描内容",
-    "配置翻译",
-    "小批量试译",
-    "完整翻译",
-    "译文检查",
-    "构建与安装",
+    "整合包",
+    "汉化",
+    "安装",
 )
 
 STAGE_STEP_INDEX = {
     WorkflowStage.WELCOME: 0,
     WorkflowStage.INSPECTING: 0,
     WorkflowStage.INSPECTION_RESULT: 0,
-    WorkflowStage.SCANNING: 1,
-    WorkflowStage.SCAN_RESULT: 1,
-    WorkflowStage.TRANSLATION_CONFIG: 2,
-    WorkflowStage.TRIAL_TRANSLATION: 3,
-    WorkflowStage.FULL_TRANSLATION: 4,
-    WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER: 5,
-    WorkflowStage.TRANSLATION_REVIEW: 5,
-    WorkflowStage.BUILD_PLACEHOLDER: 6,
-    WorkflowStage.BUILD_INSTALL: 6,
-    WorkflowStage.COMPLETION: 6,
+    WorkflowStage.SCANNING: 0,
+    WorkflowStage.SCAN_RESULT: 0,
+    WorkflowStage.TRANSLATION_CONFIG: 1,
+    WorkflowStage.TRIAL_TRANSLATION: 1,
+    WorkflowStage.FULL_TRANSLATION: 1,
+    WorkflowStage.TRANSLATION_CHECK_PLACEHOLDER: 1,
+    WorkflowStage.TRANSLATION_REVIEW: 1,
+    WorkflowStage.BUILD_PLACEHOLDER: 2,
+    WorkflowStage.BUILD_INSTALL: 2,
+    WorkflowStage.COMPLETION: 2,
 }
 
 
@@ -583,43 +579,18 @@ class MainWindow(QMainWindow):
         if index == 1:
             return (
                 bool(
-                    self.current_inspection is not None
-                    and self.current_inspection.can_continue
-                ),
-                "请先选择并识别整合包",
-            )
-        if index == 2:
-            return (
-                bool(
                     self.scan_selection is not None
                     and self.scan_selection.selected_record_count > 0
                 ),
-                "请先扫描并选择需要翻译的内容",
+                "请先完成整合包扫描并选择需要汉化的内容",
             )
-        if index == 3:
-            return (
-                self.translation_session_config is not None,
-                "请先完成翻译服务配置",
-            )
-        if index == 4:
-            return (
-                bool(self._full_selected_ids),
-                "请先完成小批量试译并确认结果",
-            )
-        if index == 5:
-            return self._review_unlocked, "请先完成完整翻译"
-        return self._build_unlocked, "请先进入译文检查"
+        return self._build_unlocked, "请先完成汉化并进入译文检查"
 
     def _step_completed(self, index: int) -> bool:
         completed = (
-            self.current_inspection is not None,
             self.current_scan_result is not None,
-            self.translation_session_config is not None,
-            self.trial_result is not None
-            and self.trial_result.successful_count > 0,
             self._review_unlocked,
-            self._build_unlocked,
-            self._build_result is not None,
+            self._install_result is not None,
         )
         return completed[index]
 
@@ -632,21 +603,35 @@ class MainWindow(QMainWindow):
         if not enabled:
             self._show_action_blocked(reason)
             return
-        if index == 1 and self.current_scan_result is None:
-            self.start_scan()
+        if index == 0:
+            if (
+                self.current_inspection is not None
+                and self.current_scan_result is None
+                and self.current_inspection.can_continue
+            ):
+                self.start_scan()
+            elif self.current_scan_result is not None:
+                self.show_scan_result()
+            elif self.current_inspection is not None:
+                self.show_inspection_result()
+            else:
+                self.show_home()
             return
-        actions = (
-            self.show_inspection_result
-            if self.current_inspection is not None
-            else self.show_home,
-            self.show_scan_result,
-            self.show_translation_config,
-            self.show_trial_translation_result,
-            self.show_full_translation_result,
-            self.show_translation_review,
-            self.show_build_install,
-        )
-        actions[index]()
+        if index == 1:
+            if self._review_unlocked:
+                self.show_translation_review()
+            elif self._full_selected_ids:
+                self.show_full_translation_result()
+            elif self.translation_session_config is not None:
+                self.show_trial_translation_result()
+            else:
+                self.show_translation_config()
+            return
+        if self._install_result is not None:
+            self._show_page(self.completion_page)
+            self.stage = WorkflowStage.COMPLETION
+        else:
+            self.show_build_install()
 
     @Slot()
     def show_settings(self) -> None:

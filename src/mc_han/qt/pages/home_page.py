@@ -79,14 +79,13 @@ class HomePage(QScrollArea):
         layout.addWidget(workflow_title)
         workflow_card = Card()
         workflow_text = QLabel(
-            "1. 选择项目  →  2. 扫描内容  →  3. 配置翻译  →  "
-            "4. 小批量试译\n"
-            "5. 完整翻译  →  6. 译文检查  →  7. 构建与安装"
+            "1. 整合包  →  2. 汉化  →  3. 安装"
         )
         workflow_text.setObjectName("ValueLabel")
         workflow_text.setWordWrap(True)
         workflow_hint = QLabel(
-            "顶部步骤会持续显示当前位置；已完成的步骤可以随时返回检查。"
+            "选择整合包后自动检测并扫描；汉化阶段包含方案、试译、完整翻译"
+            "和检查；安装阶段负责生成、导出、安装与撤销。"
         )
         workflow_hint.setObjectName("MutedLabel")
         workflow_hint.setWordWrap(True)
