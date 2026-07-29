@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,10 @@ from mc_han.qt.task_runner import InspectionTask
 from mc_han.qt.view_models import WorkflowStage
 from mc_han.scanner import ScanRecords
 from mc_han.services.scan_service import classify_scan_records
+from mc_han.services.recent_projects import (
+    RecentProject,
+    RecentProjectsStore,
+)
 from mc_han.version import get_version
 from mc_han.workflow.models import (
     CAPABILITY_ORDER,
@@ -95,6 +100,49 @@ def test_window_smoke_and_home_content(application: QApplication):
     assert not window.workflow_step_buttons[1].isEnabled()
     assert "请先选择" in window.workflow_step_buttons[1].toolTip()
 
+    window.close()
+    application.processEvents()
+
+
+def test_home_shows_recent_project_and_continues_it(
+    application: QApplication,
+    tmp_path: Path,
+):
+    project_path = tmp_path / "Demo"
+    project_path.mkdir()
+    store = RecentProjectsStore(tmp_path / "projects.json")
+    store.upsert(
+        RecentProject(
+            path=project_path,
+            display_name="Demo Pack",
+            minecraft_version="1.21.1",
+            loader_name="NeoForge",
+            last_opened="2026-01-01T00:00:00+00:00",
+        )
+    )
+    inspected: list[Path] = []
+
+    def inspect_recent(path: Path) -> ModpackInspection:
+        inspected.append(path)
+        return replace(make_result(InspectionValidity.VALID), input_directory=path)
+
+    window = MainWindow(
+        recent_projects_store=store,
+        project_discovery_service=lambda _paths: (),
+        inspection_service=inspect_recent,
+    )
+    assert window.home_page.continue_button.isVisibleTo(window)
+    assert "Demo Pack" in window.home_page.continue_button.text()
+
+    window.home_page.continue_button.click()
+    process_until(
+        application,
+        lambda: window.stage is WorkflowStage.INSPECTION_RESULT,
+    )
+
+    assert inspected == [project_path]
+    assert store.load().most_recent is not None
+    assert store.load().most_recent.last_page == "inspection"
     window.close()
     application.processEvents()
 

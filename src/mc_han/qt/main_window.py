@@ -79,6 +79,15 @@ from mc_han.qt.translation_review_view_models import (
 from mc_han.qt.view_models import InspectionPageViewModel, WorkflowStage
 from mc_han.release_info import about_text
 from mc_han.services.modpack_inspector import inspect_modpack
+from mc_han.services.project_discovery import (
+    DiscoveredProject,
+    discover_modpacks,
+)
+from mc_han.services.recent_projects import (
+    MemoryRecentProjectsStore,
+    RecentProject,
+    RecentProjectsStore,
+)
 from mc_han.services.build_install import (
     BuildWorkflowResult,
     ExportWorkflowResult,
@@ -132,6 +141,10 @@ InstallService = Callable[..., InstallResult]
 RollbackService = Callable[..., RollbackResult]
 DirectoryOpener = Callable[[Path], bool]
 CloseDecisionProvider = Callable[[str, bool], CloseDecision]
+ProjectDiscoveryService = Callable[
+    [Sequence[Path]],
+    tuple[DiscoveredProject, ...],
+]
 
 WORKFLOW_STEP_LABELS = (
     "选择项目",
@@ -176,6 +189,8 @@ class MainWindow(QMainWindow):
         directory_opener: DirectoryOpener | None = None,
         directory_picker: DirectoryPicker | None = None,
         close_decision_provider: CloseDecisionProvider | None = None,
+        recent_projects_store: RecentProjectsStore | None = None,
+        project_discovery_service: ProjectDiscoveryService | None = None,
     ) -> None:
         super().__init__()
         self._inspection_service = inspection_service
@@ -192,11 +207,27 @@ class MainWindow(QMainWindow):
         self._close_decision_provider = (
             close_decision_provider or self._prompt_close_decision
         )
+        self._recent_projects_store = (
+            recent_projects_store or MemoryRecentProjectsStore()
+        )
+        self._project_discovery_service = (
+            project_discovery_service
+            or (lambda _manual_paths: ())
+        )
+        self._recent_projects = self._recent_projects_store.load()
+        self._discovered_projects: tuple[DiscoveredProject, ...] = ()
+        self._last_directory = self._recent_projects.last_directory
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
         self.workflow_controller = WorkflowController(self)
         self.session: ProjectSession = self.workflow_controller.session
         self.workflow_controller.changed.connect(self._session_changed)
+        self._project_save_timer = QTimer(self)
+        self._project_save_timer.setSingleShot(True)
+        self._project_save_timer.setInterval(350)
+        self._project_save_timer.timeout.connect(
+            self._persist_project_progress
+        )
         self._inspection_running = False
         self._scan_running = False
         self._trial_running = False
@@ -283,6 +314,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
         self.home_page.select_requested.connect(self.choose_and_inspect)
+        self.home_page.project_requested.connect(
+            lambda path: self.start_inspection(Path(path))
+        )
         self.inspection_page.reselect_requested.connect(self.choose_and_inspect)
         self.inspection_page.home_requested.connect(self.show_home)
         self.inspection_page.scan_requested.connect(self.start_scan)
@@ -381,6 +415,7 @@ class MainWindow(QMainWindow):
             self.start_install_rollback
         )
         self.settings_page.back_requested.connect(self.close_settings)
+        self._refresh_home_projects()
         self.show_home()
 
     def _build_top_bar(self) -> QFrame:
@@ -483,6 +518,8 @@ class MainWindow(QMainWindow):
             self.activity_progress_label.setText(task.progress)
         self._refresh_step_navigation()
         self._refresh_disabled_reasons()
+        if self.current_inspection is not None:
+            self._project_save_timer.start()
 
     @Slot(int)
     def _current_page_changed(self, index: int) -> None:
@@ -764,6 +801,7 @@ class MainWindow(QMainWindow):
         self.inspection_page.show_result(
             InspectionPageViewModel.from_inspection(inspection)
         )
+        self._remember_inspection(inspection)
         self._close_if_pending()
 
     @Slot(object)
@@ -891,6 +929,7 @@ class MainWindow(QMainWindow):
             self._show_action_blocked(self._active_task_reason())
             return
         self.stage = WorkflowStage.WELCOME
+        self._refresh_home_projects()
         self._show_page(self.home_page)
         self.footer_status.setText("准备就绪")
 
@@ -1727,10 +1766,72 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(
             self,
             "选择 Minecraft 整合包目录",
-            "",
+            str(self._last_directory or ""),
             QFileDialog.Option.ShowDirsOnly,
         )
         return selected or None
+
+    def _refresh_home_projects(self) -> None:
+        self._recent_projects = self._recent_projects_store.load()
+        self._last_directory = self._recent_projects.last_directory
+        manual_paths = tuple(
+            project.path for project in self._recent_projects.projects
+        )
+        try:
+            self._discovered_projects = self._project_discovery_service(
+                manual_paths
+            )
+        except (OSError, RuntimeError, ValueError):
+            self._discovered_projects = ()
+        if hasattr(self, "home_page"):
+            self.home_page.show_projects(
+                self._recent_projects.projects,
+                self._discovered_projects,
+            )
+
+    def _remember_inspection(self, inspection: ModpackInspection) -> None:
+        previous = self._recent_projects_store.find(
+            inspection.input_directory
+        )
+        project = RecentProject.from_inspection(
+            inspection,
+            current_stage=self.stage.value,
+            last_page=self.session.current_page,
+            previous=previous,
+        )
+        try:
+            self._recent_projects = self._recent_projects_store.upsert(
+                project,
+                last_directory=inspection.input_directory,
+            )
+        except OSError:
+            self.footer_status.setText(
+                "检测完成，但最近项目未能保存"
+            )
+            return
+        self._last_directory = inspection.input_directory
+        self.home_page.show_projects(
+            self._recent_projects.projects,
+            self._discovered_projects,
+        )
+
+    @Slot()
+    def _persist_project_progress(self) -> None:
+        inspection = self.current_inspection
+        if inspection is None:
+            return
+        try:
+            self._recent_projects = (
+                self._recent_projects_store.update_progress(
+                    inspection.input_directory,
+                    current_stage=self.stage.value,
+                    last_page=self.session.current_page,
+                )
+            )
+        except OSError:
+            self.footer_status.setText(
+                "当前流程可继续，但项目进度未能保存"
+            )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._task_running():
@@ -1887,7 +1988,14 @@ def run_qt_app(
         application = QApplication(list(argv) if argv is not None else sys.argv)
     application.setApplicationName("mc-han")
     application.setOrganizationName("mc-han")
-    window = MainWindow()
+    window = MainWindow(
+        recent_projects_store=RecentProjectsStore(),
+        project_discovery_service=(
+            lambda manual_paths: discover_modpacks(
+                manual_paths=manual_paths
+            )
+        ),
+    )
     window.show()
     if not owns_application:
         return 0
